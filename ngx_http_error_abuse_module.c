@@ -687,10 +687,10 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         ctx->state = ctx->dry_run ? NGX_HTTP_ERROR_ABUSE_DRY_RUN
                                   : NGX_HTTP_ERROR_ABUSE_BLOCKED;
     } else {
-        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: status %ui counted for client \"%V\" "
                        "in zone \"%V\", count=%ui",
-                       r->headers_out.status, &ctx->key, &ctx->zone->name);
+                       r->headers_out.status, &ctx->key, &ctx->zone->name, ctx->count);
         ctx->state = NGX_HTTP_ERROR_ABUSE_COUNTED;
     }
 
