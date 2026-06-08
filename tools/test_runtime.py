@@ -66,6 +66,8 @@ def request(port: int, path: str) -> int:
 def expect(port: int, path: str, expected: int) -> None:
     actual = request(port, path)
     if actual != expected:
+        # Debug: dump Redis state on mismatch
+        print(f"ERROR: {path}: expected {expected}, got {actual}")
         raise AssertionError(f"{path}: expected {expected}, got {actual}")
 
 
@@ -369,6 +371,13 @@ def test_redis_multi_host(binary: pathlib.Path,
         first.start()
         second.start()
         time.sleep(0.2)
+
+        # Debug: check Redis state before first request
+        result = subprocess.run(
+            ["redis-cli", "-h", "127.0.0.1", "-p", str(redis_port), "KEYS", f"{prefix}*"],
+            capture_output=True, text=True, check=True
+        )
+        print(f"DEBUG: Redis keys before first request: {result.stdout.strip()}")
 
         expect(first.port, "/redis-error?client=shared", 404)
         time.sleep(0.05)
