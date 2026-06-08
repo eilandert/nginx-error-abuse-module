@@ -327,6 +327,13 @@ class RedisServer:
             stderr=subprocess.STDOUT,
         )
         wait_port(self.port)
+        # Flush all data to ensure clean state for each test
+        subprocess.run(
+            ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port), "FLUSHALL"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     def stop(self) -> None:
         if self.process is None:
