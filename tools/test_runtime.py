@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner", default="")
     parser.add_argument("--single-process", action="store_true")
     parser.add_argument("--port", type=int, default=18880)
+    parser.add_argument("--redis-server")
     return parser.parse_args()
 
 
@@ -69,8 +70,32 @@ def expect(port: int, path: str, expected: int) -> None:
 
 
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
-                 workers: int) -> str:
+                 workers: int, keyed_key: str = "$arg_client",
+                 redis_port: int | None = None,
+                 redis_prefix: str = "error-abuse-ci:") -> str:
     load = f"load_module {module};\n" if module else ""
+    redis = ""
+    redis_zone = ""
+    redis_locations = ""
+    if redis_port is not None:
+        redis = (
+            f"    error_abuse_redis host=127.0.0.1 port={redis_port} "
+            f"prefix={redis_prefix} timeout=250ms;\n"
+        )
+        redis_zone = """    error_abuse_zone zone=cluster:1m key=$arg_client
+                     statuses=404 interval=5s threshold=3 block=10s
+                     redis=on;
+"""
+        redis_locations = f"""
+        location = /redis-error {{
+            error_abuse zone=cluster status=429;
+            root {root}/empty;
+        }}
+        location = /redis-ok {{
+            error_abuse zone=cluster status=429;
+            empty_gif;
+        }}
+"""
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
 error_log {root}/logs/error.log notice;
@@ -82,10 +107,11 @@ events {{
 http {{
     access_log off;
 
+{redis}{redis_zone}
     error_abuse_zone zone=basic:1m key=$binary_remote_addr
                      statuses=403,404 interval=5s threshold=3 block=2s
                      persist={root}/basic.state persist_interval=100ms;
-    error_abuse_zone zone=keyed:1m key=$arg_client
+    error_abuse_zone zone=keyed:1m key={keyed_key}
                      statuses=404 interval=5s threshold=2 block=10s;
     error_abuse_zone zone=dry:1m key=$binary_remote_addr
                      statuses=404 interval=5s threshold=1 block=10s;
@@ -151,6 +177,7 @@ http {{
             error_abuse zone=persisted status=429;
             empty_gif;
         }}
+{redis_locations}
     }}
 }}
 """
@@ -159,23 +186,29 @@ http {{
 class Nginx:
     def __init__(self, binary: pathlib.Path, module: pathlib.Path | None,
                  root: pathlib.Path, port: int, runner: str,
-                 single_process: bool) -> None:
+                 single_process: bool, redis_port: int | None = None,
+                 redis_prefix: str = "error-abuse-ci:") -> None:
         self.binary = binary
         self.module = module
         self.root = root
         self.port = port
         self.runner = shlex.split(runner)
         self.single_process = single_process
+        self.redis_port = redis_port
+        self.redis_prefix = redis_prefix
         self.process: subprocess.Popen[str] | None = None
         self.output_path = root / "nginx-output.log"
 
-    def write_config(self) -> None:
+    def write_config(self, keyed_key: str = "$arg_client") -> None:
         workers = 1 if self.single_process else 4
         (self.root / "conf").mkdir(parents=True, exist_ok=True)
         (self.root / "logs").mkdir(parents=True, exist_ok=True)
         (self.root / "empty").mkdir(parents=True, exist_ok=True)
         (self.root / "conf" / "nginx.conf").write_text(
-            nginx_config(self.root, self.port, self.module, workers),
+            nginx_config(
+                self.root, self.port, self.module, workers, keyed_key,
+                self.redis_port, self.redis_prefix,
+            ),
             encoding="ascii",
         )
 
@@ -259,13 +292,99 @@ class Nginx:
                 continue
             if marker in combined:
                 raise AssertionError(f"runtime checker marker found: {marker}")
-        if "[alert]" in combined or "[emerg]" in combined:
-            raise AssertionError(f"nginx logged a fatal condition:\n{combined}")
+        fatal_lines = [
+            line for line in combined.splitlines()
+            if ("[alert]" in line or "[emerg]" in line)
+            and "key cannot change during reload" not in line
+        ]
+        if fatal_lines:
+            raise AssertionError(
+                "nginx logged a fatal condition:\n" + "\n".join(fatal_lines)
+            )
 
 
-def test_invalid_config(binary: pathlib.Path, module: pathlib.Path | None,
-                        root: pathlib.Path, runner: str) -> None:
-    bad = root / "bad"
+class RedisServer:
+    def __init__(self, binary: pathlib.Path, root: pathlib.Path,
+                 port: int) -> None:
+        self.binary = binary
+        self.root = root
+        self.port = port
+        self.process: subprocess.Popen[str] | None = None
+
+    def start(self) -> None:
+        self.root.mkdir(parents=True)
+        self.process = subprocess.Popen(
+            [
+                str(self.binary),
+                "--bind", "127.0.0.1",
+                "--port", str(self.port),
+                "--save", "",
+                "--appendonly", "no",
+                "--dir", str(self.root),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        wait_port(self.port)
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=10)
+        if self.process.returncode not in (0, -signal.SIGTERM):
+            output = self.process.stdout.read() if self.process.stdout else ""
+            raise RuntimeError(f"redis-server failed:\n{output}")
+        self.process = None
+
+
+def test_redis_multi_host(binary: pathlib.Path,
+                          module: pathlib.Path | None,
+                          root: pathlib.Path, runner: str,
+                          single_process: bool, nginx_port: int,
+                          redis_binary: pathlib.Path) -> None:
+    redis_port = nginx_port + 20
+    prefix = f"error-abuse-ci-{os.getpid()}:"
+    redis = RedisServer(redis_binary, root / "redis", redis_port)
+    first = Nginx(
+        binary, module, root / "redis-nginx-a", nginx_port + 1, runner,
+        single_process, redis_port, prefix,
+    )
+    second = Nginx(
+        binary, module, root / "redis-nginx-b", nginx_port + 2, runner,
+        single_process, redis_port, prefix,
+    )
+
+    try:
+        redis.start()
+        first.start()
+        second.start()
+        time.sleep(0.2)
+
+        expect(first.port, "/redis-error?client=shared", 404)
+        time.sleep(0.05)
+        expect(second.port, "/redis-error?client=shared", 404)
+        time.sleep(0.05)
+        expect(first.port, "/redis-error?client=shared", 404)
+        time.sleep(0.05)
+        expect(second.port, "/redis-ok?client=shared", 429)
+
+        expect(second.port, "/redis-ok?client=other", 200)
+        redis.stop()
+        time.sleep(0.3)
+        expect(first.port, "/redis-ok?client=redis-down", 200)
+    finally:
+        first.stop()
+        second.stop()
+        redis.stop()
+
+
+def expect_invalid_config(binary: pathlib.Path, module: pathlib.Path | None,
+                          root: pathlib.Path, runner: str, name: str,
+                          http_config: str, expected: str) -> None:
+    bad = root / name
     (bad / "conf").mkdir(parents=True)
     (bad / "logs").mkdir()
     load = f"load_module {module};\n" if module else ""
@@ -273,8 +392,7 @@ def test_invalid_config(binary: pathlib.Path, module: pathlib.Path | None,
         f"""{load}error_log {bad}/logs/error.log;
 events {{}}
 http {{
-    error_abuse_zone zone=bad:1m key=$binary_remote_addr
-                     statuses=404,700 interval=1s threshold=2 block=1s;
+{http_config}
 }}
 """,
         encoding="ascii",
@@ -287,8 +405,62 @@ http {{
         command, text=True, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=20,
     )
-    if result.returncode == 0 or "invalid error_abuse status list" not in result.stdout:
-        raise AssertionError(f"invalid status config was accepted:\n{result.stdout}")
+    if result.returncode == 0 or expected not in result.stdout:
+        raise AssertionError(
+            f"{name} config was not rejected as expected:\n{result.stdout}"
+        )
+
+
+def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
+                         root: pathlib.Path, runner: str) -> None:
+    expect_invalid_config(
+        binary, module, root, runner, "bad-status",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404,700 interval=1s threshold=2 block=1s;""",
+        "invalid error_abuse status list",
+    )
+    expect_invalid_config(
+        binary, module, root, runner, "duplicate-parameter",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s interval=2s
+                         threshold=2 block=1s;""",
+        "duplicate error_abuse_zone parameter",
+    )
+    expect_invalid_config(
+        binary, module, root, runner, "duplicate-enable-parameter",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s;
+    server {
+        error_abuse zone=bad status=429 status=403;
+    }""",
+        "duplicate error_abuse parameter",
+    )
+    expect_invalid_config(
+        binary, module, root, runner, "redis-without-backend",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         redis=on;""",
+        "requires error_abuse_redis",
+    )
+    expect_invalid_config(
+        binary, module, root, runner, "bad-redis-prefix",
+        """    error_abuse_redis host=127.0.0.1 "prefix=bad{prefix";
+    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         redis=on;""",
+        "invalid error_abuse_redis parameter",
+    )
+    shared = root / "shared.state"
+    expect_invalid_config(
+        binary, module, root, runner, "duplicate-persistence",
+        f"""    error_abuse_zone zone=one:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         persist={shared};
+    error_abuse_zone zone=two:1m key=$binary_remote_addr
+                         statuses=403 interval=1s threshold=2 block=1s
+                         persist={shared};""",
+        "use the same persistence file",
+    )
 
 
 def main() -> int:
@@ -302,7 +474,12 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp)
-        test_invalid_config(binary, module, root, args.runner)
+        test_invalid_configs(binary, module, root, args.runner)
+        if args.redis_server:
+            test_redis_multi_host(
+                binary, module, root, args.runner, args.single_process,
+                args.port, pathlib.Path(args.redis_server).absolute(),
+            )
         nginx = Nginx(
             binary, module, root / "server", args.port, args.runner,
             args.single_process,
@@ -346,6 +523,17 @@ def main() -> int:
             expect(args.port, "/persist-error", 404)
             time.sleep(0.3)
 
+            state = nginx.root / "persisted.state"
+            if not state.exists() or state.stat().st_size <= 24:
+                raise AssertionError(
+                    "periodic persistence did not write a populated snapshot"
+                )
+            mode = stat.S_IMODE(state.stat().st_mode)
+            if mode != 0o600:
+                raise AssertionError(
+                    f"periodic snapshot mode is {mode:o}, expected 600"
+                )
+
             if not args.single_process:
                 nginx.reload()
                 expect(args.port, "/persist-error", 404)
@@ -356,6 +544,16 @@ def main() -> int:
                 expect(args.port, "/persist-ok", 200)
                 expect(args.port, "/persist-error", 404)
                 expect(args.port, "/persist-error", 404)
+
+                nginx.write_config("$binary_remote_addr")
+                nginx.reload()
+                error_log = nginx.root / "logs" / "error.log"
+                if "key cannot change during reload" not in error_log.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    raise AssertionError("reload accepted a changed zone key")
+                nginx.write_config()
+                nginx.reload()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                 codes = list(pool.map(
@@ -368,7 +566,6 @@ def main() -> int:
             time.sleep(0.3)
             nginx.stop()
 
-            state = nginx.root / "persisted.state"
             mode = stat.S_IMODE(state.stat().st_mode)
             if mode != 0o600:
                 raise AssertionError(f"snapshot mode is {mode:o}, expected 600")
@@ -394,7 +591,10 @@ def main() -> int:
         finally:
             nginx.stop()
 
-    print("OK: runtime, reload, persistence, corruption and concurrency tests")
+    print(
+        "OK: runtime, multi-host Redis, reload, persistence, corruption "
+        "and concurrency tests"
+    )
     return 0
 
 

@@ -4,12 +4,20 @@
 [![Valgrind](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/valgrind.yml)
 [![CodeQL](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-error-abuse-module/actions/workflows/codeql.yml)
 
-Pure C dynamic module for NGINX and compatible servers. It counts configured
-HTTP error responses per key and temporarily blocks keys that exceed a
-threshold in a sliding time window.
+This module temporarily blocks clients that generate too many HTTP errors.
+For example, after five `403` or `404` responses within ten seconds, further
+requests from that client can receive `429 Too Many Requests` for twenty
+minutes.
 
-Typical keys are `$binary_remote_addr`, an authenticated account identifier,
-or a `map` result that is empty for exempt clients.
+You choose which response codes count, how many are allowed, the time window,
+and how long the block lasts. Clients are usually identified by IP address,
+but the key can also be an account ID or any other NGINX variable. Counters
+are shared by all workers, can optionally survive a full restart, and can be
+aggregated across multiple NGINX hosts through Redis.
+
+The module is written in C and does not use Lua or JavaScript. Local
+shared-memory and disk persistence work without a Redis server; building the
+module requires `libhiredis`.
 
 ## Features
 
@@ -20,8 +28,9 @@ or a `map` result that is empty for exempt clients.
 - Supports multiple independently configured zones.
 - Preserves state across graceful reloads automatically.
 - Can optionally persist state to disk across stop/start and host restarts.
+- Can aggregate counters and blocks across multiple NGINX hosts with Redis.
 - Supports dry-run mode and logging variables.
-- Has no Lua, JavaScript, C++, Rust, Redis, or other runtime dependency.
+- Uses non-blocking Redis I/O and retains local protection if Redis is down.
 
 ## Configuration
 
@@ -29,6 +38,9 @@ or a `map` result that is empty for exempt clients.
 load_module modules/ngx_http_error_abuse_module.so;
 
 http {
+    error_abuse_redis host=127.0.0.1 port=6379
+                      prefix=error-abuse: timeout=100ms;
+
     error_abuse_zone zone=client_errors:10m
                      key=$binary_remote_addr
                      statuses=403,404,429,500-599
@@ -36,6 +48,7 @@ http {
                      threshold=5
                      block=20m
                      inactive=1h
+                     redis=on
                      persist=/var/lib/nginx/error-abuse-client_errors.state
                      persist_interval=5s;
 
@@ -52,8 +65,10 @@ http {
 ```
 
 The state directory must already exist and be writable by the NGINX worker
-user. Persistence is optional. Without `persist=`, state survives graceful
-configuration reloads but not a full process restart.
+user. Persistence and Redis are independent and optional. Without `persist=`,
+local state survives graceful reloads but not a full process restart. With
+`redis=on`, active Redis blocks survive an NGINX restart and are shared by
+every host using the same prefix and zone configuration.
 
 ### Excluding clients
 
@@ -93,6 +108,7 @@ error_abuse_zone zone=name:size
                  threshold=number
                  block=time
                  [inactive=time]
+                 [redis=on|off]
                  [persist=path]
                  [persist_interval=time];
 ```
@@ -109,6 +125,32 @@ The status list accepts exact codes and inclusive ranges from 100 through
 `persist_interval` defaults to 5 seconds when `persist` is configured. The
 file is replaced atomically. A crash can lose changes since the last
 snapshot; graceful worker shutdown also writes a final snapshot.
+
+`redis=on` enables cluster-wide counting for this zone and requires an
+`error_abuse_redis` directive in the same `http` block. Every NGINX host
+participating in a zone must use the same zone name, interval, threshold,
+block duration, and Redis prefix.
+
+### `error_abuse_redis`
+
+Syntax:
+
+```nginx
+error_abuse_redis host=name [port=6379]
+                  [prefix=error_abuse:] [timeout=100ms];
+```
+
+Context: `http`
+
+Configures one Redis endpoint per NGINX configuration. `prefix` namespaces all
+module keys and may not contain `{` or `}`. Event and block keys use the same
+Redis hash tag, which keeps each client's keys in one slot when the configured
+endpoint provides Redis Cluster routing.
+
+Each worker maintains one asynchronous Redis connection. Block lookups pause
+the request phase without blocking the worker; matching responses queue an
+atomic sliding-window update. Redis errors are fail-open and the local
+shared-memory zone continues to enforce its own counters.
 
 ### `error_abuse`
 
@@ -139,6 +181,8 @@ also not counted, so a blocked request does not extend its own block.
 ## Building
 
 ```bash
+apt-get install libhiredis-dev
+
 ./configure --with-compat \
     --add-dynamic-module=/path/to/nginx-error-abuse-module
 make modules
@@ -153,8 +197,15 @@ The automated test and sanitizer matrix is documented in
 
 - Shared-memory exhaustion is fail-open: the response is served and an error
   is logged, but that event cannot be recorded.
+- A zone's `key` and `threshold` cannot change during a graceful reload.
+  Declare a new zone name when either value must change.
+- Each persistent zone must use its own persistence file.
 - Persistence files are local snapshots, not a cluster synchronization
   mechanism.
+- Redis synchronizes thresholds across multiple NGINX hosts. Disk snapshots
+  still preserve each host's local fallback.
+- Redis event keys expire after `inactive`; block keys expire after the
+  configured block duration.
 - A key is removed after `inactive` when it has no live block. Choose a zone
   size appropriate for the number of distinct clients and threshold.
 - The persistence format is versioned but intentionally local and binary.

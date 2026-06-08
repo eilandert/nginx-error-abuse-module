@@ -6,6 +6,8 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <hiredis/async.h>
+#include <hiredis/adapters/poll.h>
 
 #define NGX_HTTP_ERROR_ABUSE_VERSION       1
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
@@ -13,6 +15,16 @@
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC    "NGEAB01"
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN 8
+#define NGX_HTTP_ERROR_ABUSE_REDIS_TICK     5
+#define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 1000
+
+typedef struct {
+    ngx_str_t   host;
+    ngx_str_t   prefix;
+    in_port_t   port;
+    ngx_msec_t  timeout;
+    ngx_flag_t  configured;
+} ngx_http_error_abuse_redis_conf_t;
 
 typedef struct {
     ngx_rbtree_t       rbtree;
@@ -48,10 +60,12 @@ struct ngx_http_error_abuse_zone_s {
     ngx_str_t                         persist;
     ngx_msec_t                        persist_interval;
     ngx_event_t                       persist_event;
+    ngx_flag_t                        redis;
 };
 
 typedef struct {
-    ngx_array_t  zones;
+    ngx_array_t                         zones;
+    ngx_http_error_abuse_redis_conf_t   redis;
 } ngx_http_error_abuse_main_conf_t;
 
 typedef struct {
@@ -79,7 +93,22 @@ typedef struct {
     unsigned                      response_seen:1;
     unsigned                      own_rejection:1;
     unsigned                      dry_run:1;
+    unsigned                      redis_pending:1;
+    unsigned                      redis_checked:1;
+    unsigned                      redis_blocked:1;
 } ngx_http_error_abuse_req_ctx_t;
+
+typedef struct {
+    redisAsyncContext                   *context;
+    ngx_http_error_abuse_redis_conf_t   *conf;
+    ngx_event_t                          tick;
+    ngx_event_t                          reconnect;
+    ngx_log_t                           *log;
+    ngx_uint_t                           sequence;
+    uint64_t                             nonce;
+    unsigned                             ready:1;
+    unsigned                             exiting:1;
+} ngx_http_error_abuse_redis_worker_t;
 
 typedef struct {
     u_char    magic[NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN];
@@ -109,6 +138,8 @@ static char *ngx_http_error_abuse_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static ngx_int_t ngx_http_error_abuse_init_zone(ngx_shm_zone_t *shm_zone,
@@ -129,8 +160,34 @@ static ngx_int_t ngx_http_error_abuse_variable_count(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_error_abuse_variable_blocked_until(
     ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_error_abuse_redis_check(
+    ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
+static void ngx_http_error_abuse_redis_record(
+    ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
+static ngx_int_t ngx_http_error_abuse_redis_connect(void);
+static void ngx_http_error_abuse_redis_tick(ngx_event_t *ev);
+static void ngx_http_error_abuse_redis_reconnect(ngx_event_t *ev);
+static void ngx_http_error_abuse_redis_connect_callback(
+    const redisAsyncContext *ac, int status);
+static void ngx_http_error_abuse_redis_disconnect_callback(
+    const redisAsyncContext *ac, int status);
+static void ngx_http_error_abuse_redis_check_callback(
+    redisAsyncContext *ac, void *reply, void *privdata);
 
 static ngx_http_output_header_filter_pt ngx_http_error_abuse_next_header_filter;
+static ngx_http_error_abuse_redis_worker_t ngx_http_error_abuse_redis_worker;
+
+static const char ngx_http_error_abuse_redis_record_script[] =
+    "local t=redis.call('TIME') "
+    "local now=t[1]*1000+math.floor(t[2]/1000) "
+    "redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',now-ARGV[1]) "
+    "redis.call('ZADD',KEYS[1],now,now..':'..ARGV[5]) "
+    "local n=redis.call('ZCARD',KEYS[1]) "
+    "redis.call('PEXPIRE',KEYS[1],ARGV[4]) "
+    "if n>=tonumber(ARGV[2]) then "
+    "redis.call('SET',KEYS[2],'1','PX',ARGV[3]) "
+    "redis.call('DEL',KEYS[1]) return {1,n} end "
+    "return {0,n}";
 
 static ngx_conf_enum_t ngx_http_error_abuse_log_levels[] = {
     { ngx_string("info"), NGX_LOG_INFO },
@@ -154,6 +211,14 @@ static ngx_command_t ngx_http_error_abuse_commands[] = {
         NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
         ngx_http_error_abuse_enable,
         NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL
+    },
+    {
+        ngx_string("error_abuse_redis"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+        ngx_http_error_abuse_redis,
+        NGX_HTTP_MAIN_CONF_OFFSET,
         0,
         NULL
     },
@@ -482,11 +547,6 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
-    if (ctx != NULL && ctx->zone != NULL) {
-        return NGX_DECLINED;
-    }
-
     ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
     if (ctx == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -494,6 +554,22 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
 
     if (ctx->zone == NULL) {
         return NGX_DECLINED;
+    }
+
+    if (ctx->zone->redis && !ctx->redis_checked) {
+        rc = ngx_http_error_abuse_redis_check(r, ctx);
+        if (rc == NGX_AGAIN) {
+            return NGX_AGAIN;
+        }
+    }
+    if (ctx->redis_blocked) {
+        if (conf->dry_run) {
+            ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
+            return NGX_DECLINED;
+        }
+        ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
+        ctx->own_rejection = 1;
+        return conf->reject_status;
     }
 
     now = ngx_time();
@@ -562,6 +638,9 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
     now = ngx_time();
     rc = ngx_http_error_abuse_record(ctx->zone, &ctx->key, now,
                                      &ctx->count, &ctx->blocked_until);
+    if (ctx->zone->redis) {
+        ngx_http_error_abuse_redis_record(r, ctx);
+    }
     if (rc == NGX_ERROR) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "error_abuse zone \"%V\" has insufficient shared memory",
@@ -670,6 +749,17 @@ ngx_http_error_abuse_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     old = data;
 
     if (old != NULL) {
+        if (old->key.value.len != zone->key.value.len
+            || ngx_strncmp(old->key.value.data, zone->key.value.data,
+                           zone->key.value.len)
+               != 0)
+        {
+            ngx_log_error(NGX_LOG_EMERG, shm_zone->shm.log, 0,
+                          "error_abuse zone \"%V\" key cannot change "
+                          "during reload", &zone->name);
+            return NGX_ERROR;
+        }
+
         if (old->threshold != zone->threshold) {
             ngx_log_error(NGX_LOG_EMERG, shm_zone->shm.log, 0,
                           "error_abuse zone \"%V\" threshold cannot change "
@@ -793,13 +883,28 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_int_t                          n;
     ngx_uint_t                         i;
     ngx_msec_t                         parsed_time;
+    ngx_uint_t                         seen;
     ngx_http_compile_complex_value_t   ccv;
     ngx_http_error_abuse_zone_t       *zone, **slot;
     ngx_http_error_abuse_main_conf_t  *mcf;
 
+    enum {
+        NGX_HTTP_ERROR_ABUSE_SEEN_ZONE = 1 << 0,
+        NGX_HTTP_ERROR_ABUSE_SEEN_KEY = 1 << 1,
+        NGX_HTTP_ERROR_ABUSE_SEEN_STATUSES = 1 << 2,
+        NGX_HTTP_ERROR_ABUSE_SEEN_INTERVAL = 1 << 3,
+        NGX_HTTP_ERROR_ABUSE_SEEN_THRESHOLD = 1 << 4,
+        NGX_HTTP_ERROR_ABUSE_SEEN_BLOCK = 1 << 5,
+        NGX_HTTP_ERROR_ABUSE_SEEN_INACTIVE = 1 << 6,
+        NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST = 1 << 7,
+        NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_INTERVAL = 1 << 8,
+        NGX_HTTP_ERROR_ABUSE_SEEN_REDIS = 1 << 9
+    };
+
     mcf = conf;
     value = cf->args->elts;
     size = 0;
+    seen = 0;
     key.len = 0;
     statuses.len = 0;
     persist.len = 0;
@@ -811,6 +916,11 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     for (i = 1; i < cf->args->nelts; i++) {
         if (ngx_strncmp(value[i].data, "zone=", 5) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_ZONE) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_ZONE;
+
             name.data = value[i].data + 5;
             p = (u_char *) ngx_strchr(name.data, ':');
             if (p == NULL) {
@@ -832,14 +942,26 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             zone->name = name;
 
         } else if (ngx_strncmp(value[i].data, "key=", 4) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_KEY) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_KEY;
             key.data = value[i].data + 4;
             key.len = value[i].len - 4;
 
         } else if (ngx_strncmp(value[i].data, "statuses=", 9) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_STATUSES) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_STATUSES;
             statuses.data = value[i].data + 9;
             statuses.len = value[i].len - 9;
 
         } else if (ngx_strncmp(value[i].data, "interval=", 9) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_INTERVAL) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_INTERVAL;
             ngx_str_t s = { value[i].len - 9, value[i].data + 9 };
             parsed_time = ngx_parse_time(&s, 1);
             if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time == 0) {
@@ -848,6 +970,10 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             zone->interval = (time_t) parsed_time;
 
         } else if (ngx_strncmp(value[i].data, "threshold=", 10) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_THRESHOLD) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_THRESHOLD;
             n = ngx_atoi(value[i].data + 10, value[i].len - 10);
             if (n < 1 || n > NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD) {
                 goto invalid;
@@ -855,6 +981,10 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             zone->threshold = (ngx_uint_t) n;
 
         } else if (ngx_strncmp(value[i].data, "block=", 6) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_BLOCK) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_BLOCK;
             ngx_str_t s = { value[i].len - 6, value[i].data + 6 };
             parsed_time = ngx_parse_time(&s, 1);
             if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time == 0) {
@@ -863,6 +993,10 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             zone->block = (time_t) parsed_time;
 
         } else if (ngx_strncmp(value[i].data, "inactive=", 9) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_INACTIVE) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_INACTIVE;
             ngx_str_t s = { value[i].len - 9, value[i].data + 9 };
             parsed_time = ngx_parse_time(&s, 1);
             if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time == 0) {
@@ -871,6 +1005,10 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             zone->inactive = (time_t) parsed_time;
 
         } else if (ngx_strncmp(value[i].data, "persist=", 8) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST;
             persist.data = value[i].data + 8;
             persist.len = value[i].len - 8;
             if (persist.len == 0) {
@@ -878,12 +1016,34 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
         } else if (ngx_strncmp(value[i].data, "persist_interval=", 17) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_INTERVAL) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_INTERVAL;
             ngx_str_t s = { value[i].len - 17, value[i].data + 17 };
             parsed_time = ngx_parse_time(&s, 0);
             if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time < 100) {
                 goto invalid;
             }
             zone->persist_interval = parsed_time;
+
+        } else if (ngx_strncmp(value[i].data, "redis=", 6) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_REDIS) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_REDIS;
+            ngx_str_t s = { value[i].len - 6, value[i].data + 6 };
+            if (s.len == 2
+                && ngx_strcasecmp(s.data, (u_char *) "on") == 0)
+            {
+                zone->redis = 1;
+            } else if (s.len == 3
+                       && ngx_strcasecmp(s.data, (u_char *) "off") == 0)
+            {
+                zone->redis = 0;
+            } else {
+                goto invalid;
+            }
 
         } else {
             goto invalid;
@@ -941,12 +1101,43 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
+        {
+            ngx_http_error_abuse_zone_t  **zones;
+
+            zones = mcf->zones.elts;
+            for (i = 0; i < mcf->zones.nelts; i++) {
+                if (zones[i]->persist.len == zone->persist.len
+                    && ngx_strncmp(zones[i]->persist.data,
+                                   zone->persist.data,
+                                   zone->persist.len)
+                       == 0)
+                {
+                    ngx_conf_log_error(
+                        NGX_LOG_EMERG, cf, 0,
+                        "error_abuse zones \"%V\" and \"%V\" use the same "
+                        "persistence file \"%V\"",
+                        &zones[i]->name, &zone->name, &zone->persist);
+                    return NGX_CONF_ERROR;
+                }
+            }
+        }
+
         if (zone->persist_interval == 0) {
             zone->persist_interval = 5000;
         }
     } else if (zone->persist_interval != 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "persist_interval requires persist");
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_strlchr(zone->name.data, zone->name.data + zone->name.len, '{')
+        != NULL
+        || ngx_strlchr(zone->name.data, zone->name.data + zone->name.len, '}')
+           != NULL)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "error_abuse zone name may not contain braces");
         return NGX_CONF_ERROR;
     }
 
@@ -979,6 +1170,12 @@ invalid:
                        "invalid error_abuse_zone parameter \"%V\"",
                        &value[i]);
     return NGX_CONF_ERROR;
+
+duplicate:
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "duplicate error_abuse_zone parameter \"%V\"",
+                       &value[i]);
+    return NGX_CONF_ERROR;
 }
 
 static char *
@@ -986,12 +1183,20 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_str_t                         *value, name;
     ngx_int_t                          status;
-    ngx_uint_t                         i, level;
+    ngx_uint_t                         i, seen;
     ngx_http_error_abuse_loc_conf_t   *lcf;
     ngx_http_error_abuse_main_conf_t  *mcf;
 
+    enum {
+        NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_ZONE = 1 << 0,
+        NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_STATUS = 1 << 1,
+        NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_DRY_RUN = 1 << 2,
+        NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_LOG_LEVEL = 1 << 3
+    };
+
     lcf = conf;
     value = cf->args->elts;
+    seen = 0;
 
     if (cf->args->nelts == 2
         && value[1].len == 3
@@ -1012,6 +1217,10 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     for (i = 1; i < cf->args->nelts; i++) {
         if (ngx_strncmp(value[i].data, "zone=", 5) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_ZONE) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_ZONE;
             name.data = value[i].data + 5;
             name.len = value[i].len - 5;
             lcf->zone = ngx_http_error_abuse_find_zone(mcf, &name);
@@ -1022,6 +1231,10 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
         } else if (ngx_strncmp(value[i].data, "status=", 7) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_STATUS) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_STATUS;
             status = ngx_atoi(value[i].data + 7, value[i].len - 7);
             if (status < 400 || status > 599) {
                 goto invalid;
@@ -1029,6 +1242,10 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             lcf->reject_status = (ngx_uint_t) status;
 
         } else if (ngx_strncmp(value[i].data, "dry_run=", 8) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_DRY_RUN) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_DRY_RUN;
             if (value[i].len == 10
                 && ngx_strncmp(value[i].data + 8, "on", 2) == 0)
             {
@@ -1042,22 +1259,29 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
         } else if (ngx_strncmp(value[i].data, "log_level=", 10) == 0) {
-            for (level = 0;
-                 ngx_http_error_abuse_log_levels[level].name.len != 0;
-                 level++)
+            ngx_uint_t log_level;
+
+            if (seen & NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_LOG_LEVEL) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_ENABLE_SEEN_LOG_LEVEL;
+
+            for (log_level = 0;
+                 ngx_http_error_abuse_log_levels[log_level].name.len != 0;
+                 log_level++)
             {
                 if (value[i].len - 10
-                    == ngx_http_error_abuse_log_levels[level].name.len
+                    == ngx_http_error_abuse_log_levels[log_level].name.len
                     && ngx_strncmp(value[i].data + 10,
-                       ngx_http_error_abuse_log_levels[level].name.data,
+                       ngx_http_error_abuse_log_levels[log_level].name.data,
                        value[i].len - 10) == 0)
                 {
                     lcf->log_level =
-                        ngx_http_error_abuse_log_levels[level].value;
+                        ngx_http_error_abuse_log_levels[log_level].value;
                     break;
                 }
             }
-            if (ngx_http_error_abuse_log_levels[level].name.len == 0) {
+            if (ngx_http_error_abuse_log_levels[log_level].name.len == 0) {
                 goto invalid;
             }
 
@@ -1078,6 +1302,126 @@ invalid:
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                        "invalid error_abuse parameter \"%V\"", &value[i]);
     return NGX_CONF_ERROR;
+
+duplicate:
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "duplicate error_abuse parameter \"%V\"", &value[i]);
+    return NGX_CONF_ERROR;
+}
+
+static char *
+ngx_http_error_abuse_redis(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_int_t                         n;
+    ngx_uint_t                        i, seen;
+    ngx_msec_t                        timeout;
+    ngx_str_t                        *value, host, prefix;
+    ngx_http_error_abuse_main_conf_t *mcf;
+
+    enum {
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST = 1 << 0,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT = 1 << 1,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PREFIX = 1 << 2,
+        NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT = 1 << 3
+    };
+
+    mcf = conf;
+    if (mcf->redis.configured) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    host.len = 0;
+    ngx_str_set(&prefix, "error_abuse:");
+    timeout = 100;
+    seen = 0;
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_strncmp(value[i].data, "host=", 5) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_HOST;
+            host.data = value[i].data + 5;
+            host.len = value[i].len - 5;
+            if (host.len == 0) {
+                goto invalid;
+            }
+        } else if (ngx_strncmp(value[i].data, "port=", 5) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PORT;
+            n = ngx_atoi(value[i].data + 5, value[i].len - 5);
+            if (n < 1 || n > 65535) {
+                goto invalid;
+            }
+            mcf->redis.port = (in_port_t) n;
+        } else if (ngx_strncmp(value[i].data, "prefix=", 7) == 0) {
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PREFIX) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_PREFIX;
+            prefix.data = value[i].data + 7;
+            prefix.len = value[i].len - 7;
+            if (prefix.len == 0
+                || ngx_strlchr(prefix.data, prefix.data + prefix.len, '{')
+                   != NULL
+                || ngx_strlchr(prefix.data, prefix.data + prefix.len, '}')
+                   != NULL)
+            {
+                goto invalid;
+            }
+        } else if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
+            ngx_str_t s;
+
+            if (seen & NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_REDIS_SEEN_TIMEOUT;
+            s.data = value[i].data + 8;
+            s.len = value[i].len - 8;
+            timeout = ngx_parse_time(&s, 0);
+            if (timeout == (ngx_msec_t) NGX_ERROR || timeout == 0) {
+                goto invalid;
+            }
+        } else {
+            goto invalid;
+        }
+    }
+
+    if (host.len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "error_abuse_redis requires host");
+        return NGX_CONF_ERROR;
+    }
+
+    mcf->redis.host.data = ngx_pnalloc(cf->pool, host.len + 1);
+    mcf->redis.prefix.data = ngx_pnalloc(cf->pool, prefix.len);
+    if (mcf->redis.host.data == NULL || mcf->redis.prefix.data == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    ngx_memcpy(mcf->redis.host.data, host.data, host.len);
+    mcf->redis.host.data[host.len] = '\0';
+    mcf->redis.host.len = host.len;
+    ngx_memcpy(mcf->redis.prefix.data, prefix.data, prefix.len);
+    mcf->redis.prefix.len = prefix.len;
+    mcf->redis.timeout = timeout;
+    mcf->redis.configured = 1;
+
+    return NGX_CONF_OK;
+
+invalid:
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "invalid error_abuse_redis parameter \"%V\"",
+                       &value[i]);
+    return NGX_CONF_ERROR;
+
+duplicate:
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                       "duplicate error_abuse_redis parameter \"%V\"",
+                       &value[i]);
+    return NGX_CONF_ERROR;
 }
 
 static void *
@@ -1095,6 +1439,7 @@ ngx_http_error_abuse_create_main_conf(ngx_conf_t *cf)
     {
         return NULL;
     }
+    mcf->redis.port = 6379;
 
     return mcf;
 }
@@ -1140,9 +1485,24 @@ ngx_http_error_abuse_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 static ngx_int_t
 ngx_http_error_abuse_init(ngx_conf_t *cf)
 {
+    ngx_uint_t                  i;
     ngx_http_handler_pt        *handler;
+    ngx_http_error_abuse_zone_t **zones;
+    ngx_http_error_abuse_main_conf_t *mcf;
     ngx_http_core_main_conf_t  *cmcf;
     ngx_http_variable_t        *var;
+
+    mcf = ngx_http_conf_get_module_main_conf(
+        cf, ngx_http_error_abuse_module);
+    zones = mcf->zones.elts;
+    for (i = 0; i < mcf->zones.nelts; i++) {
+        if (zones[i]->redis && !mcf->redis.configured) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "redis=on in zone \"%V\" requires "
+                               "error_abuse_redis", &zones[i]->name);
+            return NGX_ERROR;
+        }
+    }
 
     for (var = ngx_http_error_abuse_variables; var->name.len; var++) {
         ngx_http_variable_t *v = ngx_http_add_variable(
@@ -1169,21 +1529,311 @@ ngx_http_error_abuse_init(ngx_conf_t *cf)
 }
 
 static ngx_int_t
+ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
+    ngx_http_error_abuse_req_ctx_t *ctx, ngx_str_t *events, ngx_str_t *block)
+{
+    static u_char hex[] = "0123456789abcdef";
+    u_char       *p;
+    size_t        base_len;
+    ngx_uint_t    i;
+    ngx_str_t    *prefix;
+
+    prefix = &ngx_http_error_abuse_redis_worker.conf->prefix;
+    base_len = prefix->len + 1 + ctx->zone->name.len + 1
+               + ctx->key.len * 2 + 1;
+
+    events->len = base_len + sizeof(":events") - 1;
+    events->data = ngx_pnalloc(pool, events->len);
+    block->len = base_len + sizeof(":block") - 1;
+    block->data = ngx_pnalloc(pool, block->len);
+    if (events->data == NULL || block->data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = events->data;
+    p = ngx_cpymem(p, prefix->data, prefix->len);
+    *p++ = '{';
+    p = ngx_cpymem(p, ctx->zone->name.data, ctx->zone->name.len);
+    *p++ = ':';
+    for (i = 0; i < ctx->key.len; i++) {
+        *p++ = hex[ctx->key.data[i] >> 4];
+        *p++ = hex[ctx->key.data[i] & 0x0f];
+    }
+    *p++ = '}';
+    p = ngx_cpymem(p, ":events", sizeof(":events") - 1);
+
+    ngx_memcpy(block->data, events->data, base_len);
+    ngx_memcpy(block->data + base_len, ":block", sizeof(":block") - 1);
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
+    ngx_http_error_abuse_req_ctx_t *ctx)
+{
+    int         rc;
+    ngx_str_t   events, block;
+    const char *argv[2];
+    size_t      argvlen[2];
+
+    if (ctx->redis_pending) {
+        return NGX_AGAIN;
+    }
+
+    if (!ngx_http_error_abuse_redis_worker.ready
+        || ngx_http_error_abuse_redis_worker.context == NULL)
+    {
+        ctx->redis_checked = 1;
+        return NGX_DECLINED;
+    }
+
+    if (ngx_http_error_abuse_redis_keys(r->pool, ctx, &events, &block)
+        != NGX_OK)
+    {
+        ctx->redis_checked = 1;
+        return NGX_DECLINED;
+    }
+
+    argv[0] = "GET";
+    argvlen[0] = 3;
+    argv[1] = (const char *) block.data;
+    argvlen[1] = block.len;
+    ctx->redis_pending = 1;
+    rc = redisAsyncCommandArgv(ngx_http_error_abuse_redis_worker.context,
+                               ngx_http_error_abuse_redis_check_callback,
+                               r, 2, argv, argvlen);
+    if (rc != REDIS_OK) {
+        ctx->redis_pending = 0;
+        ctx->redis_checked = 1;
+        return NGX_DECLINED;
+    }
+
+    return NGX_AGAIN;
+}
+
+static void
+ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
+    void *privdata)
+{
+    redisReply                        *reply;
+    ngx_http_request_t               *r;
+    ngx_http_error_abuse_req_ctx_t   *ctx;
+
+    r = privdata;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
+    if (ctx == NULL) {
+        return;
+    }
+
+    reply = data;
+    ctx->redis_pending = 0;
+    ctx->redis_checked = 1;
+    ctx->redis_blocked = reply != NULL && reply->type == REDIS_REPLY_STRING;
+    ngx_http_core_run_phases(r);
+}
+
+static void
+ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
+    ngx_http_error_abuse_req_ctx_t *ctx)
+{
+    char        interval[NGX_INT64_LEN + 1];
+    char        threshold[NGX_INT_T_LEN + 1];
+    char        block_ms[NGX_INT64_LEN + 1];
+    char        inactive[NGX_INT64_LEN + 1];
+    char        nonce[NGX_INT64_LEN * 2 + 2];
+    u_char     *p;
+    ngx_str_t   events, block;
+    const char *argv[10];
+    size_t      argvlen[10];
+
+    if (!ngx_http_error_abuse_redis_worker.ready
+        || ngx_http_error_abuse_redis_worker.context == NULL
+        || ngx_http_error_abuse_redis_keys(r->pool, ctx, &events, &block)
+           != NGX_OK)
+    {
+        return;
+    }
+
+#define NGX_ERROR_ABUSE_REDIS_NUMBER(buf, value)                              \
+    (size_t) (ngx_snprintf((u_char *) (buf), sizeof(buf), "%L",               \
+                           (int64_t) (value)) - (u_char *) (buf))
+
+    argv[0] = "EVAL";
+    argvlen[0] = 4;
+    argv[1] = ngx_http_error_abuse_redis_record_script;
+    argvlen[1] = sizeof(ngx_http_error_abuse_redis_record_script) - 1;
+    argv[2] = "2";
+    argvlen[2] = 1;
+    argv[3] = (const char *) events.data;
+    argvlen[3] = events.len;
+    argv[4] = (const char *) block.data;
+    argvlen[4] = block.len;
+    argv[5] = interval;
+    argvlen[5] = NGX_ERROR_ABUSE_REDIS_NUMBER(interval,
+                                               ctx->zone->interval * 1000);
+    argv[6] = threshold;
+    argvlen[6] = NGX_ERROR_ABUSE_REDIS_NUMBER(threshold,
+                                               ctx->zone->threshold);
+    argv[7] = block_ms;
+    argvlen[7] = NGX_ERROR_ABUSE_REDIS_NUMBER(block_ms,
+                                               ctx->zone->block * 1000);
+    argv[8] = inactive;
+    argvlen[8] = NGX_ERROR_ABUSE_REDIS_NUMBER(inactive,
+                                               ctx->zone->inactive * 1000);
+    p = ngx_snprintf((u_char *) nonce, sizeof(nonce), "%uL:%ui",
+                     ngx_http_error_abuse_redis_worker.nonce,
+                     ++ngx_http_error_abuse_redis_worker.sequence);
+    argv[9] = nonce;
+    argvlen[9] = (size_t) (p - (u_char *) nonce);
+
+    if (redisAsyncCommandArgv(ngx_http_error_abuse_redis_worker.context,
+                              NULL, NULL, 10, argv, argvlen) != REDIS_OK)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "error_abuse could not queue Redis event");
+    }
+
+#undef NGX_ERROR_ABUSE_REDIS_NUMBER
+}
+
+static void
+ngx_http_error_abuse_redis_tick(ngx_event_t *ev)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = ev->data;
+    if (worker->context != NULL) {
+        (void) redisPollTick(worker->context, 0.0);
+    }
+    if (!worker->exiting && worker->context != NULL) {
+        ngx_add_timer(ev, NGX_HTTP_ERROR_ABUSE_REDIS_TICK);
+    }
+}
+
+static void
+ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
+    int status)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = ac->data;
+    if (status == REDIS_OK) {
+        worker->ready = 1;
+        ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
+                      "error_abuse connected to Redis at \"%V:%ui\"",
+                      &worker->conf->host, worker->conf->port);
+    } else {
+        worker->ready = 0;
+        ngx_log_error(NGX_LOG_WARN, worker->log, 0,
+                      "error_abuse Redis connection failed: %s", ac->errstr);
+    }
+}
+
+static void
+ngx_http_error_abuse_redis_disconnect_callback(const redisAsyncContext *ac,
+    int status)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = ac->data;
+    worker->context = NULL;
+    worker->ready = 0;
+    if (!worker->exiting && !worker->reconnect.timer_set) {
+        ngx_add_timer(&worker->reconnect,
+                      NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT);
+    }
+}
+
+static ngx_int_t
+ngx_http_error_abuse_redis_connect(void)
+{
+    struct timeval                       timeout;
+    redisAsyncContext                   *ac;
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = &ngx_http_error_abuse_redis_worker;
+    ac = redisAsyncConnect((char *) worker->conf->host.data,
+                           worker->conf->port);
+    if (ac == NULL) {
+        return NGX_ERROR;
+    }
+    if (ac->err || redisPollAttach(ac) != REDIS_OK) {
+        redisAsyncFree(ac);
+        return NGX_ERROR;
+    }
+
+    worker->context = ac;
+    ac->data = worker;
+    timeout.tv_sec = worker->conf->timeout / 1000;
+    timeout.tv_usec = (worker->conf->timeout % 1000) * 1000;
+    (void) redisAsyncSetTimeout(ac, timeout);
+    (void) redisAsyncSetConnectCallback(
+        ac, ngx_http_error_abuse_redis_connect_callback);
+    (void) redisAsyncSetDisconnectCallback(
+        ac, ngx_http_error_abuse_redis_disconnect_callback);
+    if (!worker->tick.timer_set) {
+        ngx_add_timer(&worker->tick, NGX_HTTP_ERROR_ABUSE_REDIS_TICK);
+    }
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_error_abuse_redis_reconnect(ngx_event_t *ev)
+{
+    ngx_http_error_abuse_redis_worker_t *worker;
+
+    worker = ev->data;
+    if (!worker->exiting && ngx_http_error_abuse_redis_connect() != NGX_OK)
+    {
+        ngx_add_timer(ev, NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT);
+    }
+}
+
+static ngx_int_t
 ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
 {
     ngx_uint_t                         i;
     ngx_http_error_abuse_zone_t      **zones;
     ngx_http_error_abuse_main_conf_t  *mcf;
 
-    if (ngx_process != NGX_PROCESS_SINGLE
-        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
-    {
-        return NGX_OK;
-    }
-
     mcf = ngx_http_cycle_get_module_main_conf(cycle,
                                               ngx_http_error_abuse_module);
     if (mcf == NULL) {
+        return NGX_OK;
+    }
+
+    if (mcf->redis.configured) {
+        ngx_memzero(&ngx_http_error_abuse_redis_worker,
+                    sizeof(ngx_http_error_abuse_redis_worker));
+        ngx_http_error_abuse_redis_worker.conf = &mcf->redis;
+        ngx_http_error_abuse_redis_worker.log = cycle->log;
+        ngx_http_error_abuse_redis_worker.nonce =
+            ((uint64_t) ngx_current_msec << 32)
+            ^ (uint64_t) ngx_random()
+            ^ (uint64_t) ngx_pid;
+        ngx_http_error_abuse_redis_worker.tick.handler =
+            ngx_http_error_abuse_redis_tick;
+        ngx_http_error_abuse_redis_worker.tick.data =
+            &ngx_http_error_abuse_redis_worker;
+        ngx_http_error_abuse_redis_worker.tick.log = cycle->log;
+        ngx_http_error_abuse_redis_worker.tick.cancelable = 1;
+        ngx_http_error_abuse_redis_worker.reconnect.handler =
+            ngx_http_error_abuse_redis_reconnect;
+        ngx_http_error_abuse_redis_worker.reconnect.data =
+            &ngx_http_error_abuse_redis_worker;
+        ngx_http_error_abuse_redis_worker.reconnect.log = cycle->log;
+        ngx_http_error_abuse_redis_worker.reconnect.cancelable = 1;
+        if (ngx_http_error_abuse_redis_connect() != NGX_OK) {
+            ngx_add_timer(&ngx_http_error_abuse_redis_worker.reconnect,
+                          NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT);
+        }
+    }
+
+    if (ngx_process != NGX_PROCESS_SINGLE
+        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
+    {
         return NGX_OK;
     }
 
@@ -1213,15 +1863,29 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
     ngx_http_error_abuse_zone_t      **zones;
     ngx_http_error_abuse_main_conf_t  *mcf;
 
-    if (ngx_process != NGX_PROCESS_SINGLE
-        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
-    {
-        return;
+    if (ngx_http_error_abuse_redis_worker.conf != NULL) {
+        ngx_http_error_abuse_redis_worker.exiting = 1;
+        if (ngx_http_error_abuse_redis_worker.tick.timer_set) {
+            ngx_del_timer(&ngx_http_error_abuse_redis_worker.tick);
+        }
+        if (ngx_http_error_abuse_redis_worker.reconnect.timer_set) {
+            ngx_del_timer(&ngx_http_error_abuse_redis_worker.reconnect);
+        }
+        if (ngx_http_error_abuse_redis_worker.context != NULL) {
+            redisAsyncFree(ngx_http_error_abuse_redis_worker.context);
+            ngx_http_error_abuse_redis_worker.context = NULL;
+        }
     }
 
     mcf = ngx_http_cycle_get_module_main_conf(cycle,
                                               ngx_http_error_abuse_module);
     if (mcf == NULL) {
+        return;
+    }
+
+    if (ngx_process != NGX_PROCESS_SINGLE
+        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
+    {
         return;
     }
 
