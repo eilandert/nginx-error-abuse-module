@@ -592,7 +592,7 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     rc = ngx_http_error_abuse_is_blocked(conf->zone, &ctx->key, now,
                                          &ctx->count,
                                          &ctx->blocked_until);
-    if (rc != NGX_OK) {
+    if (rc == NGX_OK) {
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: client \"%V\" in zone \"%V\" "
                        "currently blocked",

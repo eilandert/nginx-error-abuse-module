@@ -66,24 +66,6 @@ def request(port: int, path: str) -> int:
 def expect(port: int, path: str, expected: int) -> None:
     actual = request(port, path)
     if actual != expected:
-        # Debug: dump Redis state on mismatch
-        print(f"ERROR: {path}: expected {expected}, got {actual}")
-        
-        # Try to get nginx error log for debugging
-        try:
-            import glob
-            logs = glob.glob("/tmp/error-abuse-ci-*/redis-nginx-*/logs/error.log")
-            if logs:
-                print(f"DEBUG: Found error logs: {logs}")
-                for log in logs[:2]:  # Show first 2 log files
-                    with open(log, 'r') as f:
-                        lines = f.readlines()
-                        print(f"DEBUG: Last 20 lines of {log}:")
-                        for line in lines[-20:]:
-                            print(f"  {line.rstrip()}")
-        except Exception as e:
-            print(f"DEBUG: Could not read logs: {e}")
-        
         raise AssertionError(f"{path}: expected {expected}, got {actual}")
 
 
@@ -116,7 +98,7 @@ def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
 """
     return f"""{load}worker_processes {workers};
 pid {root}/nginx.pid;
-error_log {root}/logs/error.log debug;
+error_log {root}/logs/error.log notice;
 
 events {{
     worker_connections 512;
@@ -387,13 +369,6 @@ def test_redis_multi_host(binary: pathlib.Path,
         first.start()
         second.start()
         time.sleep(0.2)
-
-        # Debug: check Redis state before first request
-        result = subprocess.run(
-            ["redis-cli", "-h", "127.0.0.1", "-p", str(redis_port), "KEYS", f"{prefix}*"],
-            capture_output=True, text=True, check=True
-        )
-        print(f"DEBUG: Redis keys before first request: {result.stdout.strip()}")
 
         expect(first.port, "/redis-error?client=shared", 404)
         time.sleep(0.05)
