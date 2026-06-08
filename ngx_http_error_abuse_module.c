@@ -1172,7 +1172,9 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
     ngx_http_error_abuse_zone_t      **zones;
     ngx_http_error_abuse_main_conf_t  *mcf;
 
-    if (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0) {
+    if (ngx_process != NGX_PROCESS_SINGLE
+        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
+    {
         return NGX_OK;
     }
 
@@ -1208,7 +1210,9 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
     ngx_http_error_abuse_zone_t      **zones;
     ngx_http_error_abuse_main_conf_t  *mcf;
 
-    if (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0) {
+    if (ngx_process != NGX_PROCESS_SINGLE
+        && (ngx_process != NGX_PROCESS_WORKER || ngx_worker != 0))
+    {
         return;
     }
 
@@ -1327,7 +1331,7 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     ngx_sprintf(tmp, "%V.tmp.%P%Z", &zone->persist, ngx_pid);
 
     fd = ngx_open_file(tmp, NGX_FILE_WRONLY, NGX_FILE_TRUNCATE,
-                       NGX_FILE_DEFAULT_ACCESS);
+                       NGX_FILE_OWNER_ACCESS);
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       ngx_open_file_n " \"%s\" failed", tmp);
