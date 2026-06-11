@@ -4,3 +4,7 @@
 __pycache__/
 build/
 objs/
+fuzz/generated_parser.inc
+fuzz/fuzz_snapshot
+fuzz/crash-*
+fuzz/corpus-min/
