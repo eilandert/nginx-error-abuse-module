@@ -40,6 +40,35 @@ typedef struct {
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
 #define NGX_HTTP_ERROR_ABUSE_STATUS_BYTES  75
 
+/* Snapshot constants + LE getters used by validate_snapshot (RFC-3) —
+ * keep in sync with the .c. */
+#define NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN  20
+
+static inline uint16_t
+ngx_http_error_abuse_get_u16(const u_char *p)
+{
+    return (uint16_t) (p[0] | (p[1] << 8));
+}
+
+static inline uint32_t
+ngx_http_error_abuse_get_u32(const u_char *p)
+{
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8)
+           | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static inline uint64_t
+ngx_http_error_abuse_get_u64(const u_char *p)
+{
+    uint64_t  v = 0;
+    int       i;
+
+    for (i = 0; i < 8; i++) {
+        v |= (uint64_t) p[i] << (8 * i);
+    }
+    return v;
+}
+
 /*
  * ngx_strlchr() — verbatim upstream (src/core/ngx_string.h, inlined here):
  * find c in [p, last); return pointer or NULL.
@@ -99,18 +128,9 @@ static inline void ngx_conf_log_error_noop(int level, ngx_conf_t *cf, ...) {
 #define ngx_conf_log_error(level, cf, err, ...) \
     ngx_conf_log_error_noop((level), (cf))
 
-/*
- * On-disk record layout — verbatim copy of the struct in
- * ../ngx_http_error_abuse_module.c. The field sizes/order define how
- * sizeof(record) and the payload arithmetic behave, so they MUST stay
- * byte-for-byte identical to production.
- */
-typedef struct {
-    uint16_t  key_len;
-    uint16_t  event_count;
-    int64_t   blocked_until;
-    int64_t   last_seen;
-} ngx_http_error_abuse_file_record_t;
+/* RFC-3: the on-disk record is now a fixed little-endian byte layout
+ * (NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN + LE getters above), not a native
+ * struct — the harness re-walk decodes it byte-for-byte. */
 
 /*
  * Only the field the validator reads (zone->threshold) is reproduced;

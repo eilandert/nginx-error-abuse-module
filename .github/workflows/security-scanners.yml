@@ -96,6 +96,14 @@ jobs:
           flawfinder --minlevel=1 \
             "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
             2>&1 | tee flawfinder.log
+          # CI-1: fail the job on any high-severity (level >= 4) finding so a
+          # serious defect cannot leave the scanners green.
+          if flawfinder --minlevel=4 --quiet \
+               "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c" \
+               2>/dev/null | grep -Eq 'Hits = [1-9]'; then
+            echo "✗ flawfinder: high-severity (>=4) findings present" >&2
+            exit 1
+          fi
           echo "✓ flawfinder: Scan complete"
 
       - name: Upload flawfinder SARIF

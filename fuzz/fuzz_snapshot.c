@@ -107,17 +107,18 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
          * in ngx_http_error_abuse_load().
          */
         volatile uint8_t sink = 0;
-        ngx_http_error_abuse_file_record_t rec;
 
         for (uint32_t i = 0; i < records; i++) {
-            if ((size_t) (last - p) < sizeof(rec)) {
+            if ((size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN) {
                 __builtin_trap();   /* validate said OK but record truncated */
             }
-            memcpy(&rec, p, sizeof(rec));
-            p += sizeof(rec);
+            /* RFC-3: little-endian record header, fixed 20-byte stride. */
+            uint16_t rec_key_len = ngx_http_error_abuse_get_u16(p);
+            uint16_t rec_event_count = ngx_http_error_abuse_get_u16(p + 2);
+            p += NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN;
 
-            size_t need = (size_t) rec.key_len
-                        + (size_t) rec.event_count * sizeof(int64_t);
+            size_t need = (size_t) rec_key_len
+                        + (size_t) rec_event_count * sizeof(int64_t);
             if ((size_t) (last - p) < need) {
                 __builtin_trap();   /* validate said OK but payload short */
             }

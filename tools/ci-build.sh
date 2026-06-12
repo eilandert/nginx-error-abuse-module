@@ -43,12 +43,21 @@ if [ "$MODE" = "asan" ]; then
     ADD_MODULE="--add-module=$MODULE_DIR"
 fi
 
+# CI-2: honour $CC (e.g. clang) so the matrix can build with either compiler.
+WITH_CC=""
+if [ -n "${CC:-}" ]; then
+    WITH_CC="--with-cc=$CC"
+fi
+
 cd "$ROOT/$DIR"
+# shellcheck disable=SC2086
 ./configure \
     --with-compat \
     --with-debug \
+    --with-threads \
     --with-http_realip_module \
     --without-http_rewrite_module \
+    $WITH_CC \
     --with-cc-opt="$CC_OPT" \
     --with-ld-opt="$LD_OPT" \
     "$ADD_MODULE"

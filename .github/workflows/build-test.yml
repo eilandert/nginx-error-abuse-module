@@ -51,15 +51,44 @@ jobs:
       - name: Lint workflows
         run: |
           version=1.7.7
-          curl -fsSL -o /tmp/actionlint.tgz \
-            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          base="https://github.com/rhysd/actionlint/releases/download/v${version}"
+          tarball="actionlint_${version}_linux_amd64.tar.gz"
+          # CI-8: verify the tarball against the checksums file published in the
+          # same signed release before executing it, so a tampered asset fails.
+          curl -fsSL -o /tmp/actionlint.tgz "${base}/${tarball}"
+          curl -fsSL -o /tmp/actionlint.checksums \
+            "${base}/actionlint_${version}_checksums.txt"
+          ( cd /tmp && grep " ${tarball}\$" actionlint.checksums \
+              | sed 's#'"${tarball}"'#actionlint.tgz#' | sha256sum -c - )
           tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
           /tmp/actionlint -color .github/workflows/*.yml
 
   build:
-    name: Build
+    name: Build (${{ matrix.flavor }} ${{ matrix.version }} / ${{ matrix.cc }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # An Angie release version can move; keep it informational so it never
+    # blocks a PR while still exercising the Angie build path.
+    continue-on-error: ${{ matrix.experimental == true }}
+    # CI-2: cover stable + mainline nginx, both compilers, and one Angie build.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            version: "1.31.1"
+            cc: gcc
+            primary: true
+          - flavor: nginx
+            version: "1.31.1"
+            cc: clang
+          - flavor: nginx
+            version: "1.28.0"
+            cc: gcc
+          - flavor: angie
+            version: "1.10.1"
+            cc: gcc
+            experimental: true
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -68,26 +97,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
+            build-essential clang curl libhiredis-dev libpcre2-dev zlib1g-dev
+
+      # CI-7: cache the downloaded source tarball, keyed by flavor+version.
+      - name: Cache source tarball
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build/${{ matrix.flavor }}-${{ matrix.version }}.tar.gz
+          key: src-${{ matrix.flavor }}-${{ matrix.version }}
 
       - name: Build server and dynamic module
+        env:
+          CC: ${{ matrix.cc }}
         run: |
-          bash tools/ci-build.sh nginx "$NGINX_VERSION"
-          build=".build/nginx-${NGINX_VERSION}/objs"
-          test -x "$build/nginx"
+          bash tools/ci-build.sh "${{ matrix.flavor }}" "${{ matrix.version }}"
+          build=".build/${{ matrix.flavor }}-${{ matrix.version }}/objs"
           test -f "$build/ngx_http_error_abuse_module.so"
-          "$build/nginx" -V 2>&1
+          ls "$build"/*nginx "$build"/*angie 2>/dev/null || true
 
       - name: Strict module compile
         run: |
-          build=".build/nginx-${NGINX_VERSION}"
+          build=".build/${{ matrix.flavor }}-${{ matrix.version }}"
           cflags=$(awk '/^CFLAGS[[:space:]]*=/{sub(/^CFLAGS[[:space:]]*=[[:space:]]*/,""); print; exit}' "$build/objs/Makefile")
           incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
           # cflags and incs are compiler flag lists and must word-split.
           # shellcheck disable=SC2086
           (
             cd "$build"
-            gcc -c -fPIC $cflags \
+            "${{ matrix.cc }}" -c -fPIC $cflags \
               -Wall -Wextra -Wshadow -Wstrict-prototypes \
               -Wstrict-aliasing -Wunreachable-code -Werror \
               -Wno-unused-parameter \
@@ -96,17 +133,64 @@ jobs:
           )
 
       - name: Stage artifact
+        if: matrix.primary
         run: |
           mkdir artifact
           cp ".build/nginx-${NGINX_VERSION}/objs/nginx" artifact/
           cp ".build/nginx-${NGINX_VERSION}/objs/ngx_http_error_abuse_module.so" artifact/
 
       - name: Upload nginx artifact
+        if: matrix.primary
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: nginx-mainline
           path: artifact/
           retention-days: 1
+
+  i386:
+    name: i386 compile (32-bit portability)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # 32-bit cross deps are best-effort; informational, never blocking.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # CI-2: a 32-bit compile catches time_t/size_t portability regressions
+      # (STAB-1). Compile-only against the configured nginx headers.
+      - name: Install 32-bit toolchain and headers
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib curl libpcre2-dev zlib1g-dev \
+            libhiredis-dev libssl-dev:i386 libhiredis-dev:i386 || \
+          sudo apt-get install -y gcc-multilib curl libpcre2-dev zlib1g-dev \
+            libhiredis-dev
+
+      - name: Configure nginx as 32-bit and syntax-check the module
+        run: |
+          ver="$NGINX_VERSION"
+          curl -fsSL "https://nginx.org/download/nginx-${ver}.tar.gz" \
+            -o "nginx-${ver}.tar.gz"
+          tar -xzf "nginx-${ver}.tar.gz"
+          (
+            cd "nginx-${ver}"
+            # 32-bit headers so NGX_PTR_SIZE/time_t match the syntax check.
+            ./configure --with-compat --with-threads \
+              --without-http_rewrite_module \
+              --with-cc-opt="-m32" --with-ld-opt="-m32" \
+              --add-dynamic-module="$GITHUB_WORKSPACE" || cat objs/autoconf.err
+          )
+          build="nginx-${ver}"
+          incs=$(awk '/^ALL_INCS[[:space:]]*=/{found=1} found{line=$0; sub(/^ALL_INCS[[:space:]]*=[[:space:]]*/,"",line); continued=(line ~ /\\$/); gsub(/\\$/, "", line); printf "%s ", line; if (!continued) exit}' "$build/objs/Makefile")
+          # shellcheck disable=SC2086
+          (
+            cd "$build"
+            gcc -m32 -fsyntax-only \
+              -Wall -Wextra -Wno-unused-parameter \
+              $incs "$GITHUB_WORKSPACE/ngx_http_error_abuse_module.c"
+          )
 
   runtime:
     name: Runtime
@@ -163,3 +247,84 @@ jobs:
             --single-process \
             --redis-server /usr/bin/redis-server \
             --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+
+  asan-reload:
+    name: ASan multi-worker + reload
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl libhiredis-dev libpcre2-dev redis-server \
+            zlib1g-dev
+
+      - name: Build with sanitizers
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      # CI-3: exercise the master + multi-worker lifecycle (reload overlap,
+      # worker shutdown, helper-process init) under ASan/UBSan — the paths the
+      # single-process job cannot reach. Leak detection stays off because
+      # nginx's own arena is not freed at fast shutdown.
+      - name: Run multi-worker suite under ASan and UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          python3 tools/test_runtime.py \
+            --redis-server /usr/bin/redis-server \
+            --nginx-binary "$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}/objs/nginx"
+
+  test-nginx:
+    name: Test::Nginx
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev \
+            cpanminus libtest-nginx-perl
+
+      # CI-6: run the Test::Nginx smoke suite against the built dynamic module.
+      - name: Build dynamic module
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION"
+
+      - name: Run t/basic.t
+        env:
+          TEST_NGINX_BINARY: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/nginx
+          TEST_NGINX_LOAD_MODULES: ${{ github.workspace }}/.build/nginx-${{ env.NGINX_VERSION }}/objs/ngx_http_error_abuse_module.so
+        run: |
+          prove -v t/basic.t
+
+  soak:
+    name: ASan soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # CI-6: a sustained soak only on schedule / manual dispatch (not every PR).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl libhiredis-dev libpcre2-dev zlib1g-dev
+
+      - name: Build with sanitizers
+        run: bash tools/ci-build.sh nginx "$NGINX_VERSION" asan
+
+      - name: Soak the memory-heavy paths
+        run: |
+          bash tools/soak.sh \
+            ".build/nginx-${NGINX_VERSION}/objs/nginx" 90 8

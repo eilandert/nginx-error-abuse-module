@@ -60,7 +60,20 @@ http {
 Read that zone line as: *"if one IP causes 100 of these error responses within
 any 5-minute window, ban it for 60 minutes."* The `persist=` file lets bans
 survive a full NGINX restart; the directory must already exist and be writable
-by the worker user.
+by the worker user. **Keep that directory private** (owned by the worker user,
+not group/world-writable): the snapshot's CRC32 detects corruption but is *not*
+tamper protection, so anyone who can write the file can forge or remove bans.
+Temp snapshots are created with `O_EXCL|O_NOFOLLOW` and `fsync`'d before the
+atomic rename, so a hostile symlink cannot redirect the write and a crash cannot
+leave a truncated state file. On builds with `--with-threads` the snapshot file
+I/O runs on a thread pool, so a slow disk never stalls the worker event loop.
+The on-disk format is a portable little-endian byte stream (not a native struct
+dump). Set `persist_secret=<hex>` to additionally authenticate the file with
+HMAC-SHA256.
+
+Client identities are stored as a fixed 32-byte SHA-256 digest of the `key`, so
+a large key variable (`$request_uri`, `$http_*`) costs the same memory and Redis
+traffic as a small one — there is no per-key amplification.
 
 **Good news:** almost everything has a sensible default. The shortest config
 that actually works is just:
@@ -85,17 +98,26 @@ deliberately relaxed policy that catches *sustained* abuse, not the odd 404.
 | `interval`         | `300s`                | Sliding time window the counting happens over.     |
 | `threshold`        | `100`                 | Hits in the window before a ban (max `1024`).       |
 | `block`            | `60m`                 | How long the ban lasts.                            |
-| `inactive`         | max(1h, interval, block) | Idle clients are forgotten after this.          |
+| `inactive`         | max(1h, interval, block) | Idle clients are forgotten after this. An explicit value must be `>=` both `interval` and `block` (otherwise live windows/bans would expire early — rejected at config time). |
 | `redis`            | `off`                 | Share this zone's state via Redis.                 |
 | `persist`          | *(none)*              | File path to snapshot state to disk.               |
 | `persist_interval` | `5s`                  | How often to write the snapshot.                   |
+| `persist_secret`   | *(none)*              | Hex-encoded key; when set, the snapshot is authenticated with HMAC-SHA256 and a tampered/forged file is rejected on load. Requires `persist`. |
 
 ### `error_abuse zone=name [status=code] [dry_run=on|off] [log_level=level]` — context: `http`, `server`, `location`
 
 Switches a declared zone on for that location. `error_abuse off;` turns it back
-off. Default ban response is `429`; log levels are `info`, `notice`, `warn`,
-`error`. `dry_run=on` logs what *would* happen without actually banning — great
-for testing. The module never counts its own ban responses or subrequests.
+off (a second declaration in the same block is a duplicate error, in either
+order). Default ban response is `429`; log levels are `info`, `notice`, `warn`,
+`error`. `dry_run=on` is **observation-only**: it logs (at `log_level`) what
+*would* happen but never writes shared-memory or Redis ban state, so an
+enforcing sibling location on the same zone is never contaminated. The module
+never counts its own ban responses or subrequests.
+
+Every ban response the module generates carries `Cache-Control: private,
+no-store` so a downstream shared cache can never replay one client's ban to
+another; `429`/`503` responses also get a `Retry-After` reflecting the ban
+deadline.
 
 ### `error_abuse_redis host=[tls://]name [port] [user] [password] [db] [prefix] [timeout]` — context: `http`
 
@@ -105,7 +127,9 @@ Points the module at one Redis server (see below).
 
 - `$error_abuse_status` — `BYPASSED`, `PASSED`, `COUNTED`, `BLOCKED`, or `DRY_RUN`.
 - `$error_abuse_count` — matching responses currently in the window.
-- `$error_abuse_blocked_until` — Unix timestamp the ban ends, or `0`.
+- `$error_abuse_blocked_until` — Unix timestamp the ban ends, or `0`. Populated
+  for both local and Redis bans (Redis stores the absolute deadline as the block
+  value).
 
 ## About Redis (optional)
 

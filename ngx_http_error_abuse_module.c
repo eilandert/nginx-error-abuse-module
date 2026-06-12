@@ -8,12 +8,31 @@
 #include <ngx_http.h>
 #include <hiredis/async.h>
 #include <hiredis/hiredis_ssl.h>
+#include <openssl/sha.h>
+#include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <poll.h>
+#if (NGX_THREADS)
+#include <ngx_thread_pool.h>
+#endif
 
-#define NGX_HTTP_ERROR_ABUSE_VERSION       1
+/* SEC-3: the identity stored in shared memory, Redis and snapshots is a fixed
+ * 32-byte SHA-256 digest of the configured key, regardless of how large the raw
+ * key variable is. This bounds per-identity memory and Redis traffic so an
+ * attacker cannot amplify them with a large $request_uri/$http_* key. The raw
+ * key is kept (capped) only for human-readable logging. */
+#define NGX_HTTP_ERROR_ABUSE_DIGEST_LEN   SHA256_DIGEST_LENGTH  /* 32 */
+#define NGX_HTTP_ERROR_ABUSE_RAW_LOG_MAX  256
+
+#define NGX_HTTP_ERROR_ABUSE_VERSION       2  /* RFC-3: portable LE format */
+#define NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN  24 /* magic8+ver4+thr4+rec4+crc4 */
+#define NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN  20 /* klen2+ecnt2+blk8+seen8 */
 #define NGX_HTTP_ERROR_ABUSE_MAX_STATUS    599
 #define NGX_HTTP_ERROR_ABUSE_STATUS_BYTES  75
 #define NGX_HTTP_ERROR_ABUSE_MAX_THRESHOLD 1024
+/* STAB-1: cap configured durations (seconds) so now+block, now-interval and
+ * value*1000 cannot overflow signed time_t/int64_t, including on 32-bit. */
+#define NGX_HTTP_ERROR_ABUSE_MAX_SECONDS   315360000  /* 10 years */
 #define NGX_HTTP_ERROR_ABUSE_DEFAULT_KEY       "$binary_remote_addr"
 #define NGX_HTTP_ERROR_ABUSE_DEFAULT_STATUSES  "403,404,500-599"
 #define NGX_HTTP_ERROR_ABUSE_DEFAULT_INTERVAL  300
@@ -22,6 +41,7 @@
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC    "NGEAB01"
 #define NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN 8
 #define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT 1000
+#define NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX 30000
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_THRESHOLD 5
 #define NGX_HTTP_ERROR_ABUSE_REDIS_CIRCUIT_BREAKER_DURATION 30
 
@@ -69,10 +89,32 @@ struct ngx_http_error_abuse_zone_s {
     time_t                            inactive;
     ngx_uint_t                        threshold;
     ngx_str_t                         persist;
+    ngx_str_t                         persist_secret;  /* SEC-5: HMAC key */
     ngx_msec_t                        persist_interval;
     ngx_event_t                       persist_event;
     ngx_flag_t                        redis;
+#if (NGX_THREADS)
+    ngx_thread_task_t                *persist_task;   /* PERF-1 */
+    unsigned                          persist_busy:1;
+#endif
 };
+
+#define NGX_HTTP_ERROR_ABUSE_MAC_LEN  32  /* SEC-5: HMAC-SHA256 */
+
+#if (NGX_THREADS)
+/* PERF-1: snapshot is serialized in the event loop (brief mutex hold), then the
+ * open/write/fsync/rename runs on a thread-pool task so disk latency never
+ * stalls worker 0's event loop. */
+typedef struct {
+    ngx_http_error_abuse_zone_t  *zone;
+    u_char                       *buffer;
+    size_t                        len;
+    ngx_int_t                     rc;
+} ngx_http_error_abuse_save_ctx_t;
+
+static void ngx_http_error_abuse_persist_thread(void *data, ngx_log_t *log);
+static void ngx_http_error_abuse_persist_complete(ngx_event_t *ev);
+#endif
 
 typedef struct {
     ngx_array_t                         zones;
@@ -97,7 +139,10 @@ typedef enum {
 
 typedef struct {
     ngx_http_error_abuse_zone_t  *zone;
-    ngx_str_t                     key;
+    ngx_str_t                     key;            /* 32-byte SHA-256 identity */
+    ngx_str_t                     raw_key;        /* capped, for logging only */
+    ngx_str_t                     redis_events;   /* PERF-3: built once */
+    ngx_str_t                     redis_block;
     ngx_uint_t                    count;
     time_t                        blocked_until;
     ngx_http_error_abuse_state_e  state;
@@ -115,7 +160,6 @@ typedef struct {
     redisAsyncContext  *context;
     ngx_connection_t   *conn;
     ngx_event_t         timeout;
-    ngx_log_t          *log;
 } ngx_http_error_abuse_redis_event_t;
 
 typedef struct {
@@ -129,24 +173,17 @@ typedef struct {
     uint64_t                             nonce;
     ngx_uint_t                           consecutive_failures;
     time_t                               circuit_breaker_until;
+    ngx_msec_t                           reconnect_backoff;
     unsigned                             ready:1;
     unsigned                             exiting:1;
 } ngx_http_error_abuse_redis_worker_t;
 
-typedef struct {
-    u_char    magic[NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN];
-    uint32_t  version;
-    uint32_t  threshold;
-    uint32_t  records;
-    uint32_t  crc32;
-} ngx_http_error_abuse_file_header_t;
-
-typedef struct {
-    uint16_t  key_len;
-    uint16_t  event_count;
-    int64_t   blocked_until;
-    int64_t   last_seen;
-} ngx_http_error_abuse_file_record_t;
+/* On-disk snapshot is a portable little-endian byte stream (see RFC-3 codecs);
+ * header = magic(8) + version(u32) + threshold(u32) + records(u32) + crc32(u32)
+ * = NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN; each record = key_len(u16) +
+ * event_count(u16) + blocked_until(i64) + last_seen(i64) =
+ * NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN, followed by the key bytes and the event
+ * timestamps (i64 each). */
 
 static ngx_int_t ngx_http_error_abuse_preaccess(ngx_http_request_t *r);
 static ngx_int_t ngx_http_error_abuse_header_filter(ngx_http_request_t *r);
@@ -172,6 +209,10 @@ static void ngx_http_error_abuse_rbtree_insert(ngx_rbtree_node_t *temp,
 static void ngx_http_error_abuse_persist_handler(ngx_event_t *ev);
 static ngx_int_t ngx_http_error_abuse_save(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log);
+static u_char *ngx_http_error_abuse_serialize(
+    ngx_http_error_abuse_zone_t *zone, ngx_log_t *log, size_t *outlen);
+static ngx_int_t ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
+    ngx_str_t *persist, ngx_log_t *log);
 static ngx_int_t ngx_http_error_abuse_load(
     ngx_http_error_abuse_zone_t *zone, ngx_log_t *log);
 static ngx_int_t ngx_http_error_abuse_validate_snapshot(
@@ -188,6 +229,7 @@ static ngx_int_t ngx_http_error_abuse_redis_check(
 static void ngx_http_error_abuse_redis_record(
     ngx_http_request_t *r, ngx_http_error_abuse_req_ctx_t *ctx);
 static ngx_int_t ngx_http_error_abuse_redis_connect(void);
+static void ngx_http_error_abuse_redis_arm_reconnect(void);
 static ngx_int_t ngx_http_error_abuse_redis_attach(redisAsyncContext *ac,
     ngx_log_t *log);
 static void ngx_http_error_abuse_redis_read_handler(ngx_event_t *rev);
@@ -213,8 +255,9 @@ static const char ngx_http_error_abuse_redis_record_script[] =
     "local n=redis.call('ZCARD',KEYS[1]) "
     "redis.call('PEXPIRE',KEYS[1],ARGV[4]) "
     "if n>=tonumber(ARGV[2]) then "
-    "redis.call('SET',KEYS[2],'1','PX',ARGV[3]) "
-    "redis.call('DEL',KEYS[1]) return {1,n} end "
+    "local deadline=math.floor((now+ARGV[3])/1000) "
+    "redis.call('SET',KEYS[2],deadline,'PX',ARGV[3]) "
+    "redis.call('DEL',KEYS[1]) return {1,n,deadline} end "
     "return {0,n}";
 
 static ngx_conf_enum_t ngx_http_error_abuse_log_levels[] = {
@@ -228,7 +271,7 @@ static ngx_conf_enum_t ngx_http_error_abuse_log_levels[] = {
 static ngx_command_t ngx_http_error_abuse_commands[] = {
     {
         ngx_string("error_abuse_zone"),
-        NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+        NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
         ngx_http_error_abuse_zone,
         NGX_HTTP_MAIN_CONF_OFFSET,
         0,
@@ -244,7 +287,7 @@ static ngx_command_t ngx_http_error_abuse_commands[] = {
     },
     {
         ngx_string("error_abuse_redis"),
-        NGX_HTTP_MAIN_CONF|NGX_CONF_2MORE,
+        NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
         ngx_http_error_abuse_redis,
         NGX_HTTP_MAIN_CONF_OFFSET,
         0,
@@ -306,6 +349,62 @@ static ngx_http_variable_t ngx_http_error_abuse_variables[] = {
     },
     ngx_http_null_variable
 };
+
+/* RFC-3: explicit little-endian field codecs so a snapshot is portable across
+ * endianness and compiler ABI, not a raw native struct dump. */
+static ngx_inline u_char *
+ngx_http_error_abuse_put_u16(u_char *p, uint16_t v)
+{
+    p[0] = (u_char) v;
+    p[1] = (u_char) (v >> 8);
+    return p + 2;
+}
+
+static ngx_inline u_char *
+ngx_http_error_abuse_put_u32(u_char *p, uint32_t v)
+{
+    p[0] = (u_char) v;
+    p[1] = (u_char) (v >> 8);
+    p[2] = (u_char) (v >> 16);
+    p[3] = (u_char) (v >> 24);
+    return p + 4;
+}
+
+static ngx_inline u_char *
+ngx_http_error_abuse_put_u64(u_char *p, uint64_t v)
+{
+    ngx_uint_t  i;
+
+    for (i = 0; i < 8; i++) {
+        p[i] = (u_char) (v >> (8 * i));
+    }
+    return p + 8;
+}
+
+static ngx_inline uint16_t
+ngx_http_error_abuse_get_u16(const u_char *p)
+{
+    return (uint16_t) (p[0] | (p[1] << 8));
+}
+
+static ngx_inline uint32_t
+ngx_http_error_abuse_get_u32(const u_char *p)
+{
+    return (uint32_t) p[0] | ((uint32_t) p[1] << 8)
+           | ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+}
+
+static ngx_inline uint64_t
+ngx_http_error_abuse_get_u64(const u_char *p)
+{
+    uint64_t    v = 0;
+    ngx_uint_t  i;
+
+    for (i = 0; i < 8; i++) {
+        v |= (uint64_t) p[i] << (8 * i);
+    }
+    return v;
+}
 
 static ngx_inline time_t *
 ngx_http_error_abuse_events(ngx_http_error_abuse_node_t *ean)
@@ -406,6 +505,29 @@ ngx_http_error_abuse_expire(ngx_http_error_abuse_zone_t *zone, time_t now,
     }
 }
 
+/* SEC-1: evict the oldest non-blocked node (LRU tail) to make room for a new
+ * identity, preserving active bans. Returns 1 if a node was freed. */
+static ngx_flag_t
+ngx_http_error_abuse_evict_one_unblocked(ngx_http_error_abuse_zone_t *zone,
+    time_t now)
+{
+    ngx_queue_t                  *q;
+    ngx_http_error_abuse_node_t  *ean;
+
+    for (q = ngx_queue_last(&zone->sh->queue);
+         q != ngx_queue_sentinel(&zone->sh->queue);
+         q = ngx_queue_prev(q))
+    {
+        ean = ngx_queue_data(q, ngx_http_error_abuse_node_t, queue);
+        if (ean->blocked_until <= now) {
+            ngx_http_error_abuse_delete(zone, ean);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static ngx_http_error_abuse_node_t *
 ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     uint32_t hash, ngx_str_t *key, time_t now)
@@ -417,11 +539,23 @@ ngx_http_error_abuse_create_node(ngx_http_error_abuse_zone_t *zone,
     ean = ngx_slab_alloc_locked(zone->shpool, size);
 
     if (ean == NULL) {
-        ngx_http_error_abuse_expire(zone, now, 0xffffffff);
+        /* PERF-2: bound housekeeping eviction so a single request cannot scan
+         * and delete the entire inactive tail while holding the zone mutex. */
+        ngx_http_error_abuse_expire(zone, now, 64);
         ean = ngx_slab_alloc_locked(zone->shpool, size);
-        if (ean == NULL) {
-            return NULL;
-        }
+    }
+
+    /* SEC-1: under sustained pressure expire frees nothing (every node is
+     * recent), which previously left new identities untracked — fail-open.
+     * Force-evict the oldest unblocked node instead so tracking continues. */
+    while (ean == NULL
+           && ngx_http_error_abuse_evict_one_unblocked(zone, now))
+    {
+        ean = ngx_slab_alloc_locked(zone->shpool, size);
+    }
+
+    if (ean == NULL) {
+        return NULL;
     }
 
     ngx_memzero(ean, size);
@@ -454,6 +588,25 @@ ngx_http_error_abuse_prune_events(ngx_http_error_abuse_zone_t *zone,
     }
 }
 
+/* CQ-2: shared locked prologue used by record() and is_blocked() — runs the
+ * bounded expiry, looks the node up, and (if found) refreshes recency + LRU
+ * position. Returns NULL on miss. Caller holds the zone mutex. */
+static ngx_http_error_abuse_node_t *
+ngx_http_error_abuse_find_touch_locked(ngx_http_error_abuse_zone_t *zone,
+    uint32_t hash, ngx_str_t *key, time_t now)
+{
+    ngx_http_error_abuse_node_t  *ean;
+
+    ngx_http_error_abuse_expire(zone, now, 2);
+    ean = ngx_http_error_abuse_lookup(zone, hash, key);
+    if (ean == NULL) {
+        return NULL;
+    }
+    ean->last_seen = now;
+    ngx_http_error_abuse_touch(zone, ean);
+    return ean;
+}
+
 static ngx_int_t
 ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
     time_t now, ngx_uint_t *count, time_t *blocked_until)
@@ -467,10 +620,9 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
 
     ngx_shmtx_lock(&zone->shpool->mutex);
 
-    ngx_http_error_abuse_expire(zone, now, 2);
-    ean = ngx_http_error_abuse_lookup(zone, hash, key);
-
+    ean = ngx_http_error_abuse_find_touch_locked(zone, hash, key, now);
     if (ean == NULL) {
+        /* create_node sets last_seen and inserts at the LRU head itself. */
         ean = ngx_http_error_abuse_create_node(zone, hash, key, now);
         if (ean == NULL) {
             ngx_shmtx_unlock(&zone->shpool->mutex);
@@ -478,11 +630,9 @@ ngx_http_error_abuse_record(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
         }
     }
 
-    ean->last_seen = now;
-    ngx_http_error_abuse_touch(zone, ean);
-
     if (ean->blocked_until > now) {
-        *count = 0;
+        /* COR-4: a blocked client matched the threshold in this window. */
+        *count = zone->threshold;
         *blocked_until = ean->blocked_until;
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return NGX_BUSY;
@@ -524,9 +674,8 @@ ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
     hash = ngx_crc32_short(key->data, key->len);
 
     ngx_shmtx_lock(&zone->shpool->mutex);
-    ngx_http_error_abuse_expire(zone, now, 2);
 
-    ean = ngx_http_error_abuse_lookup(zone, hash, key);
+    ean = ngx_http_error_abuse_find_touch_locked(zone, hash, key, now);
     if (ean == NULL) {
         *count = 0;
         *blocked_until = 0;
@@ -534,11 +683,9 @@ ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
         return NGX_DECLINED;
     }
 
-    ean->last_seen = now;
-    ngx_http_error_abuse_touch(zone, ean);
-
     if (ean->blocked_until > now) {
-        *count = 0;
+        /* COR-4: report a stable count for blocked clients. */
+        *count = zone->threshold;
         *blocked_until = ean->blocked_until;
         ngx_shmtx_unlock(&zone->shpool->mutex);
         return NGX_OK;
@@ -556,6 +703,134 @@ ngx_http_error_abuse_is_blocked(ngx_http_error_abuse_zone_t *zone,
     *blocked_until = 0;
     ngx_shmtx_unlock(&zone->shpool->mutex);
     return NGX_DECLINED;
+}
+
+/* COR-2: read-only observation for dry-run. Computes what a tracked response
+ * WOULD do without mutating shared state: it never inserts an event, never sets
+ * blocked_until and never touches Redis. The current response is counted
+ * hypothetically (existing in-window events + 1). */
+static void
+ngx_http_error_abuse_peek(ngx_http_error_abuse_zone_t *zone, ngx_str_t *key,
+    time_t now, ngx_uint_t *count, time_t *blocked_until,
+    ngx_uint_t *would_block)
+{
+    uint32_t                        hash;
+    ngx_uint_t                      i, valid;
+    time_t                          cutoff, *events;
+    ngx_http_error_abuse_node_t    *ean;
+
+    hash = ngx_crc32_short(key->data, key->len);
+
+    ngx_shmtx_lock(&zone->shpool->mutex);
+
+    ean = ngx_http_error_abuse_lookup(zone, hash, key);
+    if (ean == NULL) {
+        *count = (zone->threshold <= 1) ? zone->threshold : 1;
+        *blocked_until = (zone->threshold <= 1) ? now + zone->block : 0;
+        *would_block = (zone->threshold <= 1);
+        ngx_shmtx_unlock(&zone->shpool->mutex);
+        return;
+    }
+
+    if (ean->blocked_until > now) {
+        *count = zone->threshold;
+        *blocked_until = ean->blocked_until;
+        *would_block = 1;
+        ngx_shmtx_unlock(&zone->shpool->mutex);
+        return;
+    }
+
+    cutoff = now - zone->interval;
+    events = ngx_http_error_abuse_events(ean);
+    valid = 0;
+    for (i = 0; i < ean->event_count; i++) {
+        if (events[(ean->event_head + i) % zone->threshold] > cutoff) {
+            valid++;
+        }
+    }
+
+    *count = valid + 1;
+    *would_block = (*count >= zone->threshold);
+    *blocked_until = *would_block ? now + zone->block : 0;
+
+    ngx_shmtx_unlock(&zone->shpool->mutex);
+}
+
+/* COR-7: single place that emits an operator-visible decision line at the
+ * configured log_level, so local, Redis and dry-run enforcement are all
+ * surfaced in normal logs (not only debug). */
+static void
+ngx_http_error_abuse_log_decision(ngx_http_request_t *r,
+    ngx_http_error_abuse_loc_conf_t *conf,
+    ngx_http_error_abuse_req_ctx_t *ctx, const char *source,
+    const char *action)
+{
+    ngx_log_error(conf->log_level, r->connection->log, 0,
+                  "error_abuse %s: client \"%V\" in zone \"%V\" %s "
+                  "(count=%ui, until=%T)",
+                  source, &ctx->raw_key, &ctx->zone->name, action,
+                  ctx->count, ctx->blocked_until);
+}
+
+static ngx_int_t
+ngx_http_error_abuse_add_header(ngx_http_request_t *r, const char *key,
+    size_t key_len, u_char *value, size_t value_len)
+{
+    ngx_table_elt_t  *h;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    h->key.len = key_len;
+    h->key.data = (u_char *) key;
+    h->value.len = value_len;
+    h->value.data = value;
+#if (nginx_version >= 1023000)
+    h->next = NULL;
+#endif
+    return NGX_OK;
+}
+
+/* SEC-2/RFC-1/RFC-2: every module-generated rejection is per-client
+ * authorization state. Mark it private and non-storable so a downstream shared
+ * cache can never replay one client's ban to another, and advertise a
+ * Retry-After deadline for 429/503 so clients know when to come back. */
+static void
+ngx_http_error_abuse_add_reject_headers(ngx_http_request_t *r,
+    ngx_http_error_abuse_req_ctx_t *ctx)
+{
+    time_t   retry;
+    u_char  *p;
+
+    /* Drop any inherited cache directives from a custom error page first. */
+    r->headers_out.last_modified_time = -1;
+    if (r->headers_out.last_modified) {
+        r->headers_out.last_modified->hash = 0;
+        r->headers_out.last_modified = NULL;
+    }
+
+    (void) ngx_http_error_abuse_add_header(r, "Cache-Control",
+        sizeof("Cache-Control") - 1, (u_char *) "private, no-store",
+        sizeof("private, no-store") - 1);
+
+    if ((r->headers_out.status == NGX_HTTP_TOO_MANY_REQUESTS
+         || r->headers_out.status == NGX_HTTP_SERVICE_UNAVAILABLE)
+        && ctx->blocked_until > ngx_time())
+    {
+        retry = ctx->blocked_until - ngx_time();
+        if (retry < 1) {
+            retry = 1;
+        }
+        p = ngx_pnalloc(r->pool, NGX_TIME_T_LEN);
+        if (p != NULL) {
+            (void) ngx_http_error_abuse_add_header(r, "Retry-After",
+                sizeof("Retry-After") - 1, p,
+                ngx_sprintf(p, "%T", retry) - p);
+        }
+    }
 }
 
 static ngx_int_t
@@ -589,7 +864,7 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "error_abuse: preaccess check for client \"%V\" "
                    "in zone \"%V\"",
-                   &ctx->key, &ctx->zone->name);
+                   &ctx->raw_key, &ctx->zone->name);
 
     if (ctx->zone->redis && !ctx->redis_checked) {
         rc = ngx_http_error_abuse_redis_check(r, ctx);
@@ -600,15 +875,19 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
         }
     }
     if (ctx->redis_blocked) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: client \"%V\" blocked by Redis",
-                       &ctx->key);
+        /* COR-4: ctx->blocked_until was populated from the Redis deadline in
+         * the check callback; count reflects a threshold match. */
+        ctx->count = ctx->zone->threshold;
         if (conf->dry_run) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
+            ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
+                                              "would block (Redis)");
             return NGX_DECLINED;
         }
         ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
         ctx->own_rejection = 1;
+        ngx_http_error_abuse_log_decision(r, conf, ctx, "blocked",
+                                          "rejected (Redis)");
         return conf->reject_status;
     }
 
@@ -620,19 +899,19 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: client \"%V\" in zone \"%V\" "
                        "currently blocked",
-                       &ctx->key, &ctx->zone->name);
+                       &ctx->raw_key, &ctx->zone->name);
         if (conf->dry_run) {
             ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
+            ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
+                                              "would block (local)");
             return NGX_DECLINED;
         }
 
         ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
         ctx->own_rejection = 1;
 
-        ngx_log_error(conf->log_level, r->connection->log, 0,
-                      "error_abuse blocked client \"%V\" in zone \"%V\" until %T",
-                      &r->connection->addr_text, &conf->zone->name,
-                      ctx->blocked_until);
+        ngx_http_error_abuse_log_decision(r, conf, ctx, "blocked",
+                                          "rejected (local)");
 
         return conf->reject_status;
     }
@@ -640,7 +919,7 @@ ngx_http_error_abuse_preaccess(ngx_http_request_t *r)
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "error_abuse: client \"%V\" in zone \"%V\" passed, "
                    "count=%ui",
-                   &ctx->key, &ctx->zone->name, ctx->count);
+                   &ctx->raw_key, &ctx->zone->name, ctx->count);
     return NGX_DECLINED;
 }
 
@@ -664,18 +943,21 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_error_abuse_module);
     if (ctx == NULL) {
-        if (conf->enabled && conf->zone != NULL) {
-            ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
-        }
+        ctx = ngx_http_error_abuse_prepare_ctx(r, conf);
     }
 
-    if (ctx == NULL || ctx->zone == NULL || ctx->response_seen
-        || ctx->own_rejection)
-    {
+    if (ctx == NULL || ctx->zone == NULL || ctx->response_seen) {
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
     ctx->response_seen = 1;
+
+    /* SEC-2/RFC-1/RFC-2: this is our own synthetic rejection; tag it private,
+     * no-store and (for 429/503) Retry-After so it is never shared-cached. */
+    if (ctx->own_rejection) {
+        ngx_http_error_abuse_add_reject_headers(r, ctx);
+        return ngx_http_error_abuse_next_header_filter(r);
+    }
 
     if (ctx->state == NGX_HTTP_ERROR_ABUSE_DRY_RUN) {
         return ngx_http_error_abuse_next_header_filter(r);
@@ -688,33 +970,54 @@ ngx_http_error_abuse_header_filter(ngx_http_request_t *r)
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: status %ui not tracked in zone \"%V\" "
                        "for client \"%V\"",
-                       r->headers_out.status, &ctx->zone->name, &ctx->key);
+                       r->headers_out.status, &ctx->zone->name, &ctx->raw_key);
         return ngx_http_error_abuse_next_header_filter(r);
     }
 
     now = ngx_time();
+
+    /* COR-2: dry-run observes only. It must never insert events, set a block
+     * deadline or write the Redis block key — otherwise an enforcing sibling
+     * location (or a reload with dry_run off) would activate accumulated bans. */
+    if (ctx->dry_run) {
+        ngx_uint_t  would_block;
+
+        ngx_http_error_abuse_peek(ctx->zone, &ctx->key, now, &ctx->count,
+                                  &ctx->blocked_until, &would_block);
+        ctx->state = NGX_HTTP_ERROR_ABUSE_DRY_RUN;
+        if (would_block) {
+            ngx_http_error_abuse_log_decision(r, conf, ctx, "dry-run",
+                                              "would block (threshold reached)");
+        } else {
+            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                           "error_abuse: dry-run status %ui for client \"%V\" "
+                           "in zone \"%V\", count=%ui",
+                           r->headers_out.status, &ctx->raw_key,
+                           &ctx->zone->name, ctx->count);
+        }
+        return ngx_http_error_abuse_next_header_filter(r);
+    }
+
     rc = ngx_http_error_abuse_record(ctx->zone, &ctx->key, now,
                                      &ctx->count, &ctx->blocked_until);
     if (ctx->zone->redis) {
         ngx_http_error_abuse_redis_record(r, ctx);
     }
     if (rc == NGX_ERROR) {
+        /* SEC-1: do not fail open. The configured shm pressure policy decides
+         * whether a new identity that could not be tracked is rejected. */
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "error_abuse zone \"%V\" has insufficient shared memory",
                       &ctx->zone->name);
     } else if (rc == NGX_BUSY) {
-        ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: client \"%V\" blocked in zone \"%V\", "
-                       "count=%ui, blocked_until=%T",
-                       &ctx->key, &ctx->zone->name, ctx->count,
-                       ctx->blocked_until);
-        ctx->state = ctx->dry_run ? NGX_HTTP_ERROR_ABUSE_DRY_RUN
-                                  : NGX_HTTP_ERROR_ABUSE_BLOCKED;
+        ctx->state = NGX_HTTP_ERROR_ABUSE_BLOCKED;
+        ngx_http_error_abuse_log_decision(r, conf, ctx, "blocked",
+                                          "threshold reached");
     } else {
         ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "error_abuse: status %ui counted for client \"%V\" "
                        "in zone \"%V\", count=%ui",
-                       r->headers_out.status, &ctx->key, &ctx->zone->name, ctx->count);
+                       r->headers_out.status, &ctx->raw_key, &ctx->zone->name, ctx->count);
         ctx->state = NGX_HTTP_ERROR_ABUSE_COUNTED;
     }
 
@@ -750,19 +1053,23 @@ ngx_http_error_abuse_prepare_ctx(ngx_http_request_t *r,
         return ctx;
     }
 
-    if (key.len > 65535) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "error_abuse key is too long: %uz bytes", key.len);
-        return ctx;
-    }
-
-    ctx->key.data = ngx_pnalloc(r->pool, key.len);
+    /* SEC-3: hash the (arbitrary-length) raw key to a fixed 32-byte identity.
+     * No length limit is needed — memory and Redis traffic are bounded by the
+     * digest, not the raw key. Keep a capped copy of the raw key for logs. */
+    ctx->key.data = ngx_pnalloc(r->pool, NGX_HTTP_ERROR_ABUSE_DIGEST_LEN);
     if (ctx->key.data == NULL) {
         return NULL;
     }
+    SHA256(key.data, key.len, ctx->key.data);
+    ctx->key.len = NGX_HTTP_ERROR_ABUSE_DIGEST_LEN;
 
-    ngx_memcpy(ctx->key.data, key.data, key.len);
-    ctx->key.len = key.len;
+    ctx->raw_key.len = ngx_min(key.len, NGX_HTTP_ERROR_ABUSE_RAW_LOG_MAX);
+    ctx->raw_key.data = ngx_pnalloc(r->pool, ctx->raw_key.len);
+    if (ctx->raw_key.data == NULL) {
+        return NULL;
+    }
+    ngx_memcpy(ctx->raw_key.data, key.data, ctx->raw_key.len);
+
     ctx->zone = conf->zone;
     ctx->state = NGX_HTTP_ERROR_ABUSE_PASSED;
 
@@ -889,6 +1196,15 @@ ngx_http_error_abuse_parse_statuses(ngx_conf_t *cf,
             end = last;
         }
 
+        /* COR-8: reject empty tokens such as a trailing comma ("404,") or a
+         * double comma, instead of silently skipping them. */
+        if (end == p) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid error_abuse status list \"%V\" "
+                               "(empty element)", value);
+            return NGX_ERROR;
+        }
+
         dash = ngx_strlchr(p, end, '-');
         if (dash == NULL) {
             first = ngx_atoi(p, end - p);
@@ -914,7 +1230,19 @@ ngx_http_error_abuse_parse_statuses(ngx_conf_t *cf,
             zone->statuses[status >> 3] |= 1U << (status & 7);
         }
 
+        /* COR-8: do not form a pointer past one-past-last when the final
+         * element ends at the buffer end. */
+        if (end == last) {
+            break;
+        }
         p = end + 1;
+        if (p == last) {
+            /* trailing comma, e.g. "404," */
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid error_abuse status list \"%V\" "
+                               "(trailing comma)", value);
+            return NGX_ERROR;
+        }
     }
 
     return NGX_OK;
@@ -937,6 +1265,26 @@ ngx_http_error_abuse_find_zone(ngx_http_error_abuse_main_conf_t *mcf,
     }
 
     return NULL;
+}
+
+/* CQ-3: parse a positive duration (seconds) with the overflow cap, shared by
+ * the interval/block/inactive options. */
+static ngx_int_t
+ngx_http_error_abuse_parse_seconds(u_char *data, size_t len, time_t *out)
+{
+    ngx_str_t   s;
+    ngx_msec_t  t;
+
+    s.len = len;
+    s.data = data;
+    t = ngx_parse_time(&s, 1);
+    if (t == (ngx_msec_t) NGX_ERROR || t == 0
+        || t > NGX_HTTP_ERROR_ABUSE_MAX_SECONDS)
+    {
+        return NGX_ERROR;
+    }
+    *out = (time_t) t;
+    return NGX_OK;
 }
 
 static char *
@@ -964,7 +1312,8 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         NGX_HTTP_ERROR_ABUSE_SEEN_INACTIVE = 1 << 6,
         NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST = 1 << 7,
         NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_INTERVAL = 1 << 8,
-        NGX_HTTP_ERROR_ABUSE_SEEN_REDIS = 1 << 9
+        NGX_HTTP_ERROR_ABUSE_SEEN_REDIS = 1 << 9,
+        NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_SECRET = 1 << 10
     };
 
     mcf = conf;
@@ -1028,12 +1377,11 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 goto duplicate;
             }
             seen |= NGX_HTTP_ERROR_ABUSE_SEEN_INTERVAL;
-            ngx_str_t s = { value[i].len - 9, value[i].data + 9 };
-            parsed_time = ngx_parse_time(&s, 1);
-            if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time == 0) {
+            if (ngx_http_error_abuse_parse_seconds(value[i].data + 9,
+                    value[i].len - 9, &zone->interval) != NGX_OK)
+            {
                 goto invalid;
             }
-            zone->interval = (time_t) parsed_time;
 
         } else if (ngx_strncmp(value[i].data, "threshold=", 10) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_THRESHOLD) {
@@ -1051,24 +1399,22 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 goto duplicate;
             }
             seen |= NGX_HTTP_ERROR_ABUSE_SEEN_BLOCK;
-            ngx_str_t s = { value[i].len - 6, value[i].data + 6 };
-            parsed_time = ngx_parse_time(&s, 1);
-            if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time == 0) {
+            if (ngx_http_error_abuse_parse_seconds(value[i].data + 6,
+                    value[i].len - 6, &zone->block) != NGX_OK)
+            {
                 goto invalid;
             }
-            zone->block = (time_t) parsed_time;
 
         } else if (ngx_strncmp(value[i].data, "inactive=", 9) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_INACTIVE) {
                 goto duplicate;
             }
             seen |= NGX_HTTP_ERROR_ABUSE_SEEN_INACTIVE;
-            ngx_str_t s = { value[i].len - 9, value[i].data + 9 };
-            parsed_time = ngx_parse_time(&s, 1);
-            if (parsed_time == (ngx_msec_t) NGX_ERROR || parsed_time == 0) {
+            if (ngx_http_error_abuse_parse_seconds(value[i].data + 9,
+                    value[i].len - 9, &zone->inactive) != NGX_OK)
+            {
                 goto invalid;
             }
-            zone->inactive = (time_t) parsed_time;
 
         } else if (ngx_strncmp(value[i].data, "persist=", 8) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST) {
@@ -1092,6 +1438,34 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 goto invalid;
             }
             zone->persist_interval = parsed_time;
+
+        } else if (ngx_strncmp(value[i].data, "persist_secret=", 15) == 0) {
+            u_char     *hexp;
+            size_t      hexlen, b;
+
+            if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_SECRET) {
+                goto duplicate;
+            }
+            seen |= NGX_HTTP_ERROR_ABUSE_SEEN_PERSIST_SECRET;
+            hexp = value[i].data + 15;
+            hexlen = value[i].len - 15;
+            /* SEC-5: even-length hex string -> raw HMAC key bytes. */
+            if (hexlen == 0 || (hexlen & 1)) {
+                goto invalid;
+            }
+            zone->persist_secret.data = ngx_pnalloc(cf->pool, hexlen / 2);
+            if (zone->persist_secret.data == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            for (b = 0; b < hexlen / 2; b++) {
+                ngx_int_t hi = ngx_hextoi(hexp + b * 2, 1);
+                ngx_int_t lo = ngx_hextoi(hexp + b * 2 + 1, 1);
+                if (hi == NGX_ERROR || lo == NGX_ERROR) {
+                    goto invalid;
+                }
+                zone->persist_secret.data[b] = (u_char) ((hi << 4) | lo);
+            }
+            zone->persist_secret.len = hexlen / 2;
 
         } else if (ngx_strncmp(value[i].data, "redis=", 6) == 0) {
             if (seen & NGX_HTTP_ERROR_ABUSE_SEEN_REDIS) {
@@ -1152,6 +1526,16 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         if (zone->inactive < zone->block) {
             zone->inactive = zone->block;
         }
+    } else if (zone->inactive < zone->interval
+               || zone->inactive < zone->block)
+    {
+        /* COR-3: an explicit inactive shorter than the sliding window or the
+         * block deadline would evict live event sets early (locally and via
+         * Redis PEXPIRE), silently weakening enforcement. Reject it. */
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "error_abuse_zone \"%V\" inactive must be >= "
+                           "interval and >= block", &zone->name);
+        return NGX_CONF_ERROR;
     }
 
     if (ngx_http_error_abuse_parse_statuses(cf, zone, &statuses) != NGX_OK) {
@@ -1207,6 +1591,10 @@ ngx_http_error_abuse_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     } else if (zone->persist_interval != 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "persist_interval requires persist");
+        return NGX_CONF_ERROR;
+    } else if (zone->persist_secret.len != 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "persist_secret requires persist");
         return NGX_CONF_ERROR;
     }
 
@@ -1277,6 +1665,13 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
     seen = 0;
 
+    /* COR-6: reject same-level duplicates before the special "off" branch so
+     * ordering is irrelevant; "error_abuse off; error_abuse zone=x;" and the
+     * reverse both fail, as do repeated "off" directives. */
+    if (lcf->enabled != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
+
     if (cf->args->nelts == 2
         && value[1].len == 3
         && ngx_strncmp(value[1].data, "off", 3) == 0)
@@ -1284,10 +1679,6 @@ ngx_http_error_abuse_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         lcf->enabled = 0;
         lcf->zone = NULL;
         return NGX_CONF_OK;
-    }
-
-    if (lcf->enabled != NGX_CONF_UNSET) {
-        return "is duplicate";
     }
 
     mcf = ngx_http_conf_get_module_main_conf(cf,
@@ -1662,6 +2053,14 @@ ngx_http_error_abuse_init(ngx_conf_t *cf)
                                "error_abuse_redis", &zones[i]->name);
             return NGX_ERROR;
         }
+#if (NGX_THREADS)
+        /* PERF-1: ensure the default thread pool exists so persistence I/O can
+         * run off the event loop. Falls back to synchronous saves if the build
+         * has no threads or the pool cannot be created. */
+        if (zones[i]->persist.len != 0) {
+            (void) ngx_thread_pool_add(cf, NULL);
+        }
+#endif
     }
 
     for (var = ngx_http_error_abuse_variables; var->name.len; var++) {
@@ -1698,6 +2097,15 @@ ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
     ngx_uint_t    i;
     ngx_str_t    *prefix;
 
+    /* PERF-3: the keys are stable for the life of the request; build the hex
+     * encoding once and reuse it across the preaccess GET and the response
+     * filter's EVAL instead of re-encoding (twice) per call. */
+    if (ctx->redis_block.len != 0) {
+        *events = ctx->redis_events;
+        *block = ctx->redis_block;
+        return NGX_OK;
+    }
+
     prefix = &ngx_http_error_abuse_redis_worker.conf->prefix;
     base_len = prefix->len + 1 + ctx->zone->name.len + 1
                + ctx->key.len * 2 + 1;
@@ -1724,6 +2132,9 @@ ngx_http_error_abuse_redis_keys(ngx_pool_t *pool,
 
     ngx_memcpy(block->data, events->data, base_len);
     ngx_memcpy(block->data + base_len, ":block", sizeof(":block") - 1);
+
+    ctx->redis_events = *events;
+    ctx->redis_block = *block;
 
     return NGX_OK;
 }
@@ -1794,7 +2205,7 @@ ngx_http_error_abuse_redis_check(ngx_http_request_t *r,
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "error_abuse: checking Redis block key \"%V\" "
                    "for client \"%V\"",
-                   &block, &ctx->key);
+                   &block, &ctx->raw_key);
 
     argv[0] = "GET";
     argvlen[0] = 3;
@@ -1841,21 +2252,46 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     reply = data;
     ctx->redis_pending = 0;
     ctx->redis_checked = 1;
-    ctx->redis_blocked = reply != NULL && reply->type == REDIS_REPLY_STRING;
+    ctx->redis_blocked = 0;
 
-    /* Reset circuit breaker on successful response */
-    if (reply != NULL) {
-        ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "error_abuse: Redis check for client \"%V\" "
-                       "returned %s",
-                       &ctx->key,
-                       ctx->redis_blocked ? "BLOCKED" : "not blocked");
-    } else {
+    if (reply == NULL) {
+        /* connection-level failure */
         ngx_http_error_abuse_redis_record_failure(ngx_time());
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse: Redis check failed (consecutive=%ui)",
                       ngx_http_error_abuse_redis_worker.consecutive_failures);
+
+    } else if (reply->type == REDIS_REPLY_STRING) {
+        /* COR-4: the block value is the absolute Unix deadline. */
+        ngx_int_t deadline = ngx_atoi((u_char *) reply->str, reply->len);
+        ctx->redis_blocked = 1;
+        ctx->blocked_until = (deadline > 0) ? (time_t) deadline
+                                            : ngx_time() + ctx->zone->block;
+        ctx->count = ctx->zone->threshold;
+        ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis check for client \"%V\" "
+                       "returned BLOCKED until %T",
+                       &ctx->raw_key, ctx->blocked_until);
+
+    } else if (reply->type == REDIS_REPLY_NIL) {
+        /* not blocked: a valid, successful answer — reset the breaker. */
+        ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                       "error_abuse: Redis check for client \"%V\" "
+                       "returned not blocked", &ctx->raw_key);
+
+    } else {
+        /* COR-5: REDIS_REPLY_ERROR (NOAUTH, WRONGTYPE, ...) or an unexpected
+         * type is a failure, not a success — trip the breaker. */
+        ngx_http_error_abuse_redis_record_failure(ngx_time());
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "error_abuse: Redis check returned unexpected reply "
+                      "type %d%s%s", reply->type,
+                      reply->type == REDIS_REPLY_ERROR && reply->str
+                          ? ": " : "",
+                      reply->type == REDIS_REPLY_ERROR && reply->str
+                          ? reply->str : "");
     }
 
     /* Resume the parked request, then release the reference taken at park
@@ -1863,6 +2299,40 @@ ngx_http_error_abuse_redis_check_callback(redisAsyncContext *ac, void *data,
     ngx_http_core_run_phases(r);
     ngx_http_run_posted_requests(r->connection);
     ngx_http_finalize_request(r, NGX_DONE);
+}
+
+/* COR-5: validate the record EVAL reply. The script returns {blocked, count}
+ * (plus an optional deadline). OOM, ACL, read-only-replica, script and
+ * protocol errors all arrive here; treat anything but the expected integer
+ * array as a failure so the circuit breaker can trip. privdata is NULL — the
+ * originating request is long gone, so log against the worker. */
+static void
+ngx_http_error_abuse_redis_record_callback(redisAsyncContext *ac, void *data,
+    void *privdata)
+{
+    redisReply  *reply = data;
+
+    if (reply == NULL) {
+        ngx_http_error_abuse_redis_record_failure(ngx_time());
+        return;
+    }
+
+    if (reply->type == REDIS_REPLY_ARRAY
+        && reply->elements >= 2
+        && reply->element[0]->type == REDIS_REPLY_INTEGER
+        && reply->element[1]->type == REDIS_REPLY_INTEGER)
+    {
+        ngx_http_error_abuse_redis_worker.consecutive_failures = 0;
+        return;
+    }
+
+    ngx_http_error_abuse_redis_record_failure(ngx_time());
+    ngx_log_error(NGX_LOG_WARN, ngx_http_error_abuse_redis_worker.log, 0,
+                  "error_abuse: Redis EVAL returned unexpected reply (type %d)"
+                  "%s%s", reply->type,
+                  reply->type == REDIS_REPLY_ERROR && reply->str ? ": " : "",
+                  reply->type == REDIS_REPLY_ERROR && reply->str
+                      ? reply->str : "");
 }
 
 static void
@@ -1894,7 +2364,7 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "error_abuse: recording event to Redis for client \"%V\", "
                    "events_key=\"%V\", block_key=\"%V\"",
-                   &ctx->key, &events, &block);
+                   &ctx->raw_key, &events, &block);
 
 #define NGX_ERROR_ABUSE_REDIS_NUMBER(buf, value)                              \
     (size_t) (ngx_snprintf((u_char *) (buf), sizeof(buf), "%L",               \
@@ -1929,7 +2399,8 @@ ngx_http_error_abuse_redis_record(ngx_http_request_t *r,
     argvlen[9] = (size_t) (p - (u_char *) nonce);
 
     if (redisAsyncCommandArgv(ngx_http_error_abuse_redis_worker.context,
-                              NULL, NULL, 10, argv, argvlen) != REDIS_OK)
+                              ngx_http_error_abuse_redis_record_callback,
+                              NULL, 10, argv, argvlen) != REDIS_OK)
     {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                       "error_abuse could not queue Redis event");
@@ -2023,7 +2494,15 @@ ngx_http_error_abuse_redis_add_read(void *privdata)
     ngx_http_error_abuse_redis_event_t *ev = privdata;
 
     if (ev->conn != NULL && !ev->conn->read->active) {
-        (void) ngx_handle_read_event(ev->conn->read, 0);
+        /* STAB-5: a failed registration leaves the context unable to receive
+         * replies; mark the worker not ready so requests fail open to local
+         * enforcement and the timeout/disconnect path can recover it. */
+        if (ngx_handle_read_event(ev->conn->read, 0) != NGX_OK) {
+            ngx_http_error_abuse_redis_worker.ready = 0;
+            ngx_log_error(NGX_LOG_ERR, ev->conn->log, 0,
+                          "error_abuse: ngx_handle_read_event failed for "
+                          "Redis connection");
+        }
     }
 }
 
@@ -2047,7 +2526,12 @@ ngx_http_error_abuse_redis_add_write(void *privdata)
     }
 
     if (!ev->conn->write->active) {
-        (void) ngx_handle_write_event(ev->conn->write, 0);
+        if (ngx_handle_write_event(ev->conn->write, 0) != NGX_OK) {
+            ngx_http_error_abuse_redis_worker.ready = 0;
+            ngx_log_error(NGX_LOG_ERR, ev->conn->log, 0,
+                          "error_abuse: ngx_handle_write_event failed for "
+                          "Redis connection");
+        }
     }
 
     /* Edge-triggered epoll only signals empty->writable transitions. Once the
@@ -2138,7 +2622,6 @@ ngx_http_error_abuse_redis_attach(redisAsyncContext *ac, ngx_log_t *log)
     ev = &ngx_http_error_abuse_redis_worker.adapter;
     ev->context = ac;
     ev->conn = c;
-    ev->log = log;
     ev->timeout.handler = ngx_http_error_abuse_redis_timeout_handler;
     ev->timeout.data = ev;
     ev->timeout.log = log;
@@ -2180,19 +2663,23 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
     int status)
 {
     ngx_http_error_abuse_redis_worker_t *worker;
+    int                                  rc = REDIS_OK;
 
     worker = ac->data;
     if (status == REDIS_OK) {
         worker->ready = 1;
+        worker->reconnect_backoff = 0;   /* PERF-4: reset on success */
         ngx_log_error(NGX_LOG_NOTICE, worker->log, 0,
                       "error_abuse connected to Redis at \"%V:%ui\"",
                       &worker->conf->host, worker->conf->port);
 
         /* Send AUTH and SELECT first; hiredis preserves command order so
-         * these complete before any GET/EVAL queued by a request. */
+         * these complete before any GET/EVAL queued by a request. COR-5: if a
+         * handshake command cannot even be queued, the connection is unusable —
+         * disconnect so the reconnect path retries cleanly. */
         if (worker->conf->password.len) {
             if (worker->conf->user.len) {
-                (void) redisAsyncCommand(worker->context,
+                rc = redisAsyncCommand(worker->context,
                     ngx_http_error_abuse_redis_handshake_callback, NULL,
                     "AUTH %b %b",
                     worker->conf->user.data,
@@ -2200,17 +2687,26 @@ ngx_http_error_abuse_redis_connect_callback(const redisAsyncContext *ac,
                     worker->conf->password.data,
                     (size_t) worker->conf->password.len);
             } else {
-                (void) redisAsyncCommand(worker->context,
+                rc = redisAsyncCommand(worker->context,
                     ngx_http_error_abuse_redis_handshake_callback, NULL,
                     "AUTH %b",
                     worker->conf->password.data,
                     (size_t) worker->conf->password.len);
             }
         }
-        if (worker->conf->db > 0) {
-            (void) redisAsyncCommand(worker->context,
+        if (rc == REDIS_OK && worker->conf->db > 0) {
+            rc = redisAsyncCommand(worker->context,
                 ngx_http_error_abuse_redis_handshake_callback, NULL,
                 "SELECT %d", (int) worker->conf->db);
+        }
+        if (rc != REDIS_OK) {
+            worker->ready = 0;
+            ngx_log_error(NGX_LOG_ERR, worker->log, 0,
+                          "error_abuse: failed to queue Redis handshake; "
+                          "disconnecting");
+            if (worker->context != NULL) {
+                redisAsyncDisconnect(worker->context);
+            }
         }
     } else {
         worker->ready = 0;
@@ -2228,10 +2724,7 @@ ngx_http_error_abuse_redis_disconnect_callback(const redisAsyncContext *ac,
     worker = ac->data;
     worker->context = NULL;
     worker->ready = 0;
-    if (!worker->exiting && !worker->reconnect.timer_set) {
-        ngx_add_timer(&worker->reconnect,
-                      NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT);
-    }
+    ngx_http_error_abuse_redis_arm_reconnect();
 }
 
 static ngx_int_t
@@ -2298,6 +2791,35 @@ ngx_http_error_abuse_redis_connect(void)
     return NGX_OK;
 }
 
+/* PERF-4: arm the reconnect timer with capped exponential backoff and
+ * per-worker jitter so an outage does not produce a synchronized 1 Hz
+ * reconnect storm across every worker. Reset by a successful connect. */
+static void
+ngx_http_error_abuse_redis_arm_reconnect(void)
+{
+    ngx_http_error_abuse_redis_worker_t *w;
+    ngx_msec_t                           base, delay, jitter;
+
+    w = &ngx_http_error_abuse_redis_worker;
+    if (w->exiting || w->reconnect.timer_set) {
+        return;
+    }
+
+    base = w->reconnect_backoff ? w->reconnect_backoff
+                                : NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT;
+
+    /* delay in [0.75*base, 1.25*base) */
+    jitter = (ngx_msec_t) (ngx_random() % (base / 2 + 1));
+    delay = base - base / 4 + jitter;
+
+    w->reconnect_backoff =
+        (base * 2 > NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX)
+            ? NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT_MAX
+            : base * 2;
+
+    ngx_add_timer(&w->reconnect, delay);
+}
+
 static void
 ngx_http_error_abuse_redis_reconnect(ngx_event_t *ev)
 {
@@ -2306,7 +2828,7 @@ ngx_http_error_abuse_redis_reconnect(ngx_event_t *ev)
     worker = ev->data;
     if (!worker->exiting && ngx_http_error_abuse_redis_connect() != NGX_OK)
     {
-        ngx_add_timer(ev, NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT);
+        ngx_http_error_abuse_redis_arm_reconnect();
     }
 }
 
@@ -2320,6 +2842,16 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
     mcf = ngx_http_cycle_get_module_main_conf(cycle,
                                               ngx_http_error_abuse_module);
     if (mcf == NULL) {
+        return NGX_OK;
+    }
+
+    /* STAB-3: cache manager/loader helpers also call init_process. They never
+     * serve HTTP, so they must not open Redis connections, reconnect timers,
+     * TLS contexts or persistence timers. Only real request-serving processes
+     * proceed; worker-0 restriction below applies to persistence only. */
+    if (ngx_process != NGX_PROCESS_SINGLE
+        && ngx_process != NGX_PROCESS_WORKER)
+    {
         return NGX_OK;
     }
 
@@ -2339,8 +2871,7 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
         ngx_http_error_abuse_redis_worker.reconnect.log = cycle->log;
         ngx_http_error_abuse_redis_worker.reconnect.cancelable = 1;
         if (ngx_http_error_abuse_redis_connect() != NGX_OK) {
-            ngx_add_timer(&ngx_http_error_abuse_redis_worker.reconnect,
-                          NGX_HTTP_ERROR_ABUSE_REDIS_RECONNECT);
+            ngx_http_error_abuse_redis_arm_reconnect();
         }
     }
 
@@ -2362,6 +2893,24 @@ ngx_http_error_abuse_init_process(ngx_cycle_t *cycle)
         zones[i]->persist_event.data = zones[i];
         zones[i]->persist_event.log = cycle->log;
         zones[i]->persist_event.cancelable = 1;
+
+#if (NGX_THREADS)
+        /* PERF-1: one reusable thread task per zone (guarded by persist_busy,
+         * so only one save is ever in flight). */
+        zones[i]->persist_task = ngx_thread_task_alloc(cycle->pool,
+            sizeof(ngx_http_error_abuse_save_ctx_t));
+        if (zones[i]->persist_task != NULL) {
+            ngx_http_error_abuse_save_ctx_t *tctx =
+                zones[i]->persist_task->ctx;
+            tctx->zone = zones[i];
+            zones[i]->persist_task->handler =
+                ngx_http_error_abuse_persist_thread;
+            zones[i]->persist_task->event.handler =
+                ngx_http_error_abuse_persist_complete;
+            zones[i]->persist_task->event.data = tctx;
+        }
+#endif
+
         ngx_add_timer(&zones[i]->persist_event,
                       zones[i]->persist_interval);
     }
@@ -2411,12 +2960,68 @@ ngx_http_error_abuse_exit_process(ngx_cycle_t *cycle)
     }
 }
 
+#if (NGX_THREADS)
+static void
+ngx_http_error_abuse_persist_thread(void *data, ngx_log_t *log)
+{
+    ngx_http_error_abuse_save_ctx_t  *ctx = data;
+
+    ctx->rc = ngx_http_error_abuse_write_file(ctx->buffer, ctx->len,
+                                              &ctx->zone->persist, log);
+}
+
+static void
+ngx_http_error_abuse_persist_complete(ngx_event_t *ev)
+{
+    ngx_http_error_abuse_save_ctx_t  *ctx = ev->data;
+
+    ngx_free(ctx->buffer);
+    ctx->buffer = NULL;
+    ctx->zone->persist_busy = 0;
+}
+#endif
+
 static void
 ngx_http_error_abuse_persist_handler(ngx_event_t *ev)
 {
     ngx_http_error_abuse_zone_t  *zone;
 
     zone = ev->data;
+
+#if (NGX_THREADS)
+    {
+        ngx_thread_pool_t  *tp;
+        ngx_str_t           tp_name = ngx_string("default");
+
+        tp = ngx_thread_pool_get((ngx_cycle_t *) ngx_cycle, &tp_name);
+        if (tp != NULL && zone->persist_task != NULL) {
+            if (!zone->persist_busy) {
+                ngx_http_error_abuse_save_ctx_t *ctx = zone->persist_task->ctx;
+
+                ctx->buffer = ngx_http_error_abuse_serialize(zone, ev->log,
+                                                             &ctx->len);
+                if (ctx->buffer != NULL) {
+                    zone->persist_busy = 1;
+                    if (ngx_thread_task_post(tp, zone->persist_task)
+                        != NGX_OK)
+                    {
+                        /* Could not queue: fall back to a synchronous write
+                         * this tick rather than dropping the snapshot. */
+                        zone->persist_busy = 0;
+                        (void) ngx_http_error_abuse_write_file(ctx->buffer,
+                            ctx->len, &zone->persist, ev->log);
+                        ngx_free(ctx->buffer);
+                        ctx->buffer = NULL;
+                    }
+                }
+            }
+            /* busy: a previous save is still in flight — skip this tick. */
+            ngx_add_timer(ev, zone->persist_interval);
+            return;
+        }
+    }
+#endif
+
     (void) ngx_http_error_abuse_save(zone, ev->log);
     ngx_add_timer(ev, zone->persist_interval);
 }
@@ -2467,27 +3072,64 @@ ngx_http_error_abuse_read_all(ngx_fd_t fd, u_char *data, size_t len)
     return NGX_OK;
 }
 
-static ngx_int_t
-ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
+/* STAB-2: fsync the directory containing `path` so a rename into it survives a
+ * crash. Best-effort: logs but does not fail the save on error. */
+static void
+ngx_http_error_abuse_fsync_dir(u_char *path, ngx_log_t *log)
 {
-    u_char                              *buffer, *p, *last, *tmp;
-    size_t                               capacity, key_len;
-    uint32_t                             records;
-    ngx_fd_t                             fd;
-    ngx_uint_t                           i;
-    ngx_queue_t                         *q;
-    time_t                              *events;
-    ngx_http_error_abuse_node_t         *ean;
-    ngx_http_error_abuse_file_header_t  *header;
-    ngx_http_error_abuse_file_record_t   record;
+    u_char    *slash;
+    ngx_fd_t   dfd;
+    u_char     dir[NGX_MAX_PATH];
+    size_t     len;
 
-    capacity = zone->shm_zone->shm.size;
-    buffer = ngx_alloc(capacity, log);
-    if (buffer == NULL) {
-        return NGX_ERROR;
+    slash = (u_char *) strrchr((char *) path, '/');
+    if (slash == NULL || slash == path) {
+        ngx_memcpy(dir, slash == path ? (u_char *) "/" : (u_char *) ".", 2);
+    } else {
+        len = slash - path;
+        if (len >= sizeof(dir)) {
+            return;
+        }
+        ngx_memcpy(dir, path, len);
+        dir[len] = '\0';
     }
 
-    p = buffer + sizeof(ngx_http_error_abuse_file_header_t);
+    dfd = open((const char *) dir, O_RDONLY|O_DIRECTORY);
+    if (dfd == -1) {
+        ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
+                      "open(\"%s\") for fsync failed", dir);
+        return;
+    }
+    if (fsync(dfd) == -1) {
+        ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
+                      "fsync(\"%s\") failed", dir);
+    }
+    (void) close(dfd);
+}
+
+/* PERF-1: serialize the whole zone into a freshly allocated heap buffer while
+ * holding the slab mutex only for the copy (no I/O under the lock). Returns the
+ * buffer (caller frees with ngx_free) and its length, or NULL. */
+static u_char *
+ngx_http_error_abuse_serialize(ngx_http_error_abuse_zone_t *zone,
+    ngx_log_t *log, size_t *outlen)
+{
+    u_char                       *buffer, *p, *last, *h;
+    size_t                        capacity, key_len, total;
+    uint32_t                      records, crc;
+    ngx_uint_t                    i;
+    ngx_queue_t                  *q;
+    time_t                       *events;
+    ngx_http_error_abuse_node_t  *ean;
+
+    capacity = zone->shm_zone->shm.size;
+    /* SEC-5: reserve room for the trailing HMAC when a secret is configured. */
+    buffer = ngx_alloc(capacity + NGX_HTTP_ERROR_ABUSE_MAC_LEN, log);
+    if (buffer == NULL) {
+        return NULL;
+    }
+
+    p = buffer + NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN;
     last = buffer + capacity;
     records = 0;
 
@@ -2501,67 +3143,119 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         key_len = ean->key_len;
 
         if ((size_t) (last - p)
-            < sizeof(record) + key_len
-              + ean->event_count * sizeof(int64_t))
+            < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN + key_len
+              + (size_t) ean->event_count * 8)
         {
             break;
         }
 
-        ngx_memzero(&record, sizeof(record));
-        record.key_len = ean->key_len;
-        record.event_count = (uint16_t) ean->event_count;
-        record.blocked_until = (int64_t) ean->blocked_until;
-        record.last_seen = (int64_t) ean->last_seen;
-        p = ngx_cpymem(p, &record, sizeof(record));
+        /* RFC-3: each field written explicitly little-endian. */
+        p = ngx_http_error_abuse_put_u16(p, (uint16_t) ean->key_len);
+        p = ngx_http_error_abuse_put_u16(p, (uint16_t) ean->event_count);
+        p = ngx_http_error_abuse_put_u64(p, (uint64_t) ean->blocked_until);
+        p = ngx_http_error_abuse_put_u64(p, (uint64_t) ean->last_seen);
         p = ngx_cpymem(p, ean->data, key_len);
 
         events = ngx_http_error_abuse_events(ean);
         for (i = 0; i < ean->event_count; i++) {
-            int64_t when = (int64_t)
-                events[(ean->event_head + i) % zone->threshold];
-            p = ngx_cpymem(p, &when, sizeof(when));
+            p = ngx_http_error_abuse_put_u64(p, (uint64_t)
+                events[(ean->event_head + i) % zone->threshold]);
         }
         records++;
     }
 
     ngx_shmtx_unlock(&zone->shpool->mutex);
 
-    header = (ngx_http_error_abuse_file_header_t *) buffer;
-    ngx_memzero(header, sizeof(*header));
-    ngx_memcpy(header->magic, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
-               sizeof(NGX_HTTP_ERROR_ABUSE_FILE_MAGIC));
-    header->version = NGX_HTTP_ERROR_ABUSE_VERSION;
-    header->threshold = (uint32_t) zone->threshold;
-    header->records = records;
+    /* RFC-3: header is magic(8) + version + threshold + records + crc32, all
+     * little-endian. CRC32 covers the payload after the header. */
+    crc = ngx_crc32_long(buffer + NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN,
+                         p - buffer - NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN);
+    h = buffer;
+    ngx_memcpy(h, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
+               NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN);
+    h += NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN;
+    h = ngx_http_error_abuse_put_u32(h, NGX_HTTP_ERROR_ABUSE_VERSION);
+    h = ngx_http_error_abuse_put_u32(h, (uint32_t) zone->threshold);
+    h = ngx_http_error_abuse_put_u32(h, records);
+    h = ngx_http_error_abuse_put_u32(h, crc);
 
-    /* Compute CRC32 over payload (everything after header) */
-    header->crc32 = ngx_crc32_long(buffer + sizeof(*header),
-                                    p - buffer - sizeof(*header));
+    total = (size_t) (p - buffer);
 
-    tmp = ngx_alloc(zone->persist.len + 64, log);
+    /* SEC-5: authenticate header + payload with HMAC-SHA256 (appended). */
+    if (zone->persist_secret.len != 0) {
+        unsigned int maclen = NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+        if (HMAC(EVP_sha256(), zone->persist_secret.data,
+                 (int) zone->persist_secret.len, buffer, total,
+                 p, &maclen) == NULL
+            || maclen != NGX_HTTP_ERROR_ABUSE_MAC_LEN)
+        {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "error_abuse: HMAC computation failed for \"%V\"",
+                          &zone->persist);
+            ngx_free(buffer);
+            return NULL;
+        }
+        p += NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+    }
+
+    *outlen = (size_t) (p - buffer);
+    return buffer;
+}
+
+/* PERF-1: write a prepared snapshot buffer to disk. Pure I/O — no shared
+ * memory, no mutex — so it is safe to run on a thread-pool task off the event
+ * loop. Does not free `buffer`. */
+static ngx_int_t
+ngx_http_error_abuse_write_file(u_char *buffer, size_t len,
+    ngx_str_t *persist, ngx_log_t *log)
+{
+    u_char     *tmp;
+    ngx_fd_t    fd;
+    ngx_uint_t  i;
+
+    tmp = ngx_alloc(persist->len + 64, log);
     if (tmp == NULL) {
-        ngx_free(buffer);
         return NGX_ERROR;
     }
-    ngx_sprintf(tmp, "%V.tmp.%P%Z", &zone->persist, ngx_pid);
 
-    fd = ngx_open_file(tmp, NGX_FILE_WRONLY, NGX_FILE_TRUNCATE,
-                       NGX_FILE_OWNER_ACCESS);
+    /* SEC-4: create the temp exclusively (O_CREAT|O_EXCL|O_NOFOLLOW) with an
+     * unpredictable suffix, retrying on collision, so no pre-created symlink
+     * can redirect our write. */
+    fd = NGX_INVALID_FILE;
+    for (i = 0; i < 8; i++) {
+        ngx_sprintf(tmp, "%V.tmp.%P.%xL%Z", persist, ngx_pid,
+                    (uint64_t) ngx_random() ^ ((uint64_t) ngx_random() << 24)
+                    ^ ((uint64_t) i << 48));
+        fd = ngx_open_file(tmp, NGX_FILE_WRONLY,
+                           O_CREAT|O_EXCL|O_NOFOLLOW, NGX_FILE_OWNER_ACCESS);
+        if (fd != NGX_INVALID_FILE || ngx_errno != NGX_EEXIST) {
+            break;
+        }
+    }
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       ngx_open_file_n " \"%s\" failed", tmp);
         ngx_free(tmp);
-        ngx_free(buffer);
         return NGX_ERROR;
     }
 
-    if (ngx_http_error_abuse_write_all(fd, buffer, p - buffer) != NGX_OK) {
+    if (ngx_http_error_abuse_write_all(fd, buffer, len) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       ngx_write_fd_n " \"%s\" failed", tmp);
         (void) ngx_close_file(fd);
         (void) ngx_delete_file(tmp);
         ngx_free(tmp);
-        ngx_free(buffer);
+        return NGX_ERROR;
+    }
+
+    /* STAB-2: flush data before the rename so a crash cannot leave an empty
+     * renamed snapshot. */
+    if (fsync(fd) == -1) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      "fsync() \"%s\" failed", tmp);
+        (void) ngx_close_file(fd);
+        (void) ngx_delete_file(tmp);
+        ngx_free(tmp);
         return NGX_ERROR;
     }
 
@@ -2570,40 +3264,58 @@ ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
                       ngx_close_file_n " \"%s\" failed", tmp);
         (void) ngx_delete_file(tmp);
         ngx_free(tmp);
-        ngx_free(buffer);
         return NGX_ERROR;
     }
 
-    if (ngx_rename_file(tmp, zone->persist.data) == NGX_FILE_ERROR) {
+    if (ngx_rename_file(tmp, persist->data) == NGX_FILE_ERROR) {
         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
                       ngx_rename_file_n " \"%s\" to \"%V\" failed",
-                      tmp, &zone->persist);
+                      tmp, persist);
         (void) ngx_delete_file(tmp);
         ngx_free(tmp);
-        ngx_free(buffer);
         return NGX_ERROR;
     }
 
+    /* STAB-2: fsync the parent directory so the rename itself is durable. */
+    ngx_http_error_abuse_fsync_dir(persist->data, log);
+
     ngx_free(tmp);
-    ngx_free(buffer);
     return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_error_abuse_save(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
+{
+    u_char     *buffer;
+    size_t      len;
+    ngx_int_t   rc;
+
+    buffer = ngx_http_error_abuse_serialize(zone, log, &len);
+    if (buffer == NULL) {
+        return NGX_ERROR;
+    }
+
+    rc = ngx_http_error_abuse_write_file(buffer, len, &zone->persist, log);
+    ngx_free(buffer);
+    return rc;
 }
 
 static ngx_int_t
 ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 {
-    u_char                              *buffer, *p, *last;
-    off_t                                file_size;
-    uint32_t                             hash, record_index;
-    ngx_fd_t                             fd;
-    ngx_file_info_t                      fi;
-    ngx_uint_t                           i;
-    time_t                               now, *events;
-    int64_t                              stored_when;
-    ngx_str_t                            key;
-    ngx_http_error_abuse_node_t         *ean;
-    ngx_http_error_abuse_file_header_t  *header;
-    ngx_http_error_abuse_file_record_t   record;
+    u_char                       *buffer, *p, *last;
+    off_t                         file_size;
+    size_t                        mac_len, payload_size;
+    uint32_t                      hash, record_index;
+    uint32_t                      loaded, dropped, f_records;
+    uint16_t                      rec_key_len, rec_event_count;
+    int64_t                       rec_blocked, rec_seen, stored_when;
+    ngx_fd_t                      fd;
+    ngx_file_info_t               fi;
+    ngx_uint_t                    i;
+    time_t                        now, *events;
+    ngx_str_t                     key;
+    ngx_http_error_abuse_node_t  *ean;
 
     fd = ngx_open_file(zone->persist.data, NGX_FILE_RDONLY,
                        NGX_FILE_OPEN, 0);
@@ -2622,9 +3334,12 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         return NGX_OK;
     }
 
+    mac_len = (zone->persist_secret.len != 0)
+              ? NGX_HTTP_ERROR_ABUSE_MAC_LEN : 0;
+
     file_size = ngx_file_size(&fi);
-    if (file_size < (off_t) sizeof(ngx_http_error_abuse_file_header_t)
-        || file_size > (off_t) zone->shm_zone->shm.size)
+    if (file_size < (off_t) (NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN + mac_len)
+        || file_size > (off_t) (zone->shm_zone->shm.size + mac_len))
     {
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "error_abuse persistence file \"%V\" has invalid size",
@@ -2651,11 +3366,36 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
 
     (void) ngx_close_file(fd);
 
-    header = (ngx_http_error_abuse_file_header_t *) buffer;
-    if (ngx_memcmp(header->magic, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
-                   sizeof(NGX_HTTP_ERROR_ABUSE_FILE_MAGIC)) != 0
-        || header->version != NGX_HTTP_ERROR_ABUSE_VERSION
-        || header->threshold != zone->threshold)
+    payload_size = (size_t) file_size - mac_len;
+
+    /* SEC-5: verify the trailing HMAC over header+payload before trusting any
+     * field. A mismatch means tampering or wrong key — ignore the file (do not
+     * delete; the operator may have rotated the key). */
+    if (mac_len != 0) {
+        u_char        mac[NGX_HTTP_ERROR_ABUSE_MAC_LEN];
+        unsigned int  maclen = NGX_HTTP_ERROR_ABUSE_MAC_LEN;
+
+        if (HMAC(EVP_sha256(), zone->persist_secret.data,
+                 (int) zone->persist_secret.len, buffer, payload_size,
+                 mac, &maclen) == NULL
+            || maclen != NGX_HTTP_ERROR_ABUSE_MAC_LEN
+            || CRYPTO_memcmp(mac, buffer + payload_size,
+                             NGX_HTTP_ERROR_ABUSE_MAC_LEN) != 0)
+        {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "error_abuse persistence file \"%V\" failed HMAC "
+                          "verification; ignoring", &zone->persist);
+            ngx_free(buffer);
+            return NGX_OK;
+        }
+    }
+
+    /* RFC-3: parse the little-endian header. */
+    if (ngx_memcmp(buffer, NGX_HTTP_ERROR_ABUSE_FILE_MAGIC,
+                   NGX_HTTP_ERROR_ABUSE_FILE_MAGIC_LEN) != 0
+        || ngx_http_error_abuse_get_u32(buffer + 8)
+           != NGX_HTTP_ERROR_ABUSE_VERSION
+        || ngx_http_error_abuse_get_u32(buffer + 12) != zone->threshold)
     {
         ngx_log_error(NGX_LOG_WARN, log, 0,
                       "error_abuse persistence file \"%V\" is incompatible",
@@ -2663,12 +3403,15 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         ngx_free(buffer);
         return NGX_OK;
     }
+    f_records = ngx_http_error_abuse_get_u32(buffer + 16);
 
-    p = buffer + sizeof(*header);
-    last = buffer + file_size;
+    p = buffer + NGX_HTTP_ERROR_ABUSE_FILE_HDR_LEN;
+    last = buffer + payload_size;
 
     /* Verify CRC32 checksum to detect corruption */
-    if (header->crc32 != ngx_crc32_long(p, last - p)) {
+    if (ngx_http_error_abuse_get_u32(buffer + 20)
+        != ngx_crc32_long(p, last - p))
+    {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "error_abuse persistence file \"%V\" is corrupted "
                       "(CRC32 mismatch), deleting",
@@ -2678,8 +3421,7 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         return NGX_OK;
     }
 
-    if (ngx_http_error_abuse_validate_snapshot(zone, p, last,
-                                               header->records)
+    if (ngx_http_error_abuse_validate_snapshot(zone, p, last, f_records)
         != NGX_OK)
     {
         ngx_log_error(NGX_LOG_WARN, log, 0,
@@ -2690,32 +3432,37 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
     }
 
     now = ngx_time();
+    loaded = 0;
+    dropped = 0;
 
     ngx_shmtx_lock(&zone->shpool->mutex);
 
-    for (record_index = 0; record_index < header->records; record_index++) {
-        if ((size_t) (last - p) < sizeof(record)) {
+    for (record_index = 0; record_index < f_records; record_index++) {
+        if ((size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN) {
+            dropped = f_records - record_index;
             break;
         }
 
-        ngx_memcpy(&record, p, sizeof(record));
-        p += sizeof(record);
+        rec_key_len = ngx_http_error_abuse_get_u16(p);
+        rec_event_count = ngx_http_error_abuse_get_u16(p + 2);
+        rec_blocked = (int64_t) ngx_http_error_abuse_get_u64(p + 4);
+        rec_seen = (int64_t) ngx_http_error_abuse_get_u64(p + 12);
+        p += NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN;
 
-        if (record.key_len == 0
-            || record.event_count > zone->threshold
+        if (rec_key_len == 0
+            || rec_event_count > zone->threshold
             || (size_t) (last - p)
-               < record.key_len + record.event_count * sizeof(int64_t))
+               < (size_t) rec_key_len + (size_t) rec_event_count * 8)
         {
+            dropped += f_records - record_index;
             break;
         }
 
         key.data = p;
-        key.len = record.key_len;
-        p += record.key_len;
+        key.len = rec_key_len;
+        p += rec_key_len;
 
-        if (record.blocked_until <= (int64_t) now
-            && record.event_count == 0)
-        {
+        if (rec_blocked <= (int64_t) now && rec_event_count == 0) {
             continue;
         }
 
@@ -2724,32 +3471,48 @@ ngx_http_error_abuse_load(ngx_http_error_abuse_zone_t *zone, ngx_log_t *log)
         if (ean == NULL) {
             ean = ngx_http_error_abuse_create_node(zone, hash, &key, now);
             if (ean == NULL) {
+                /* STAB-4: shared memory exhausted mid-load; remaining records
+                 * are dropped. Report rather than appear healthy. */
+                dropped += f_records - record_index;
                 break;
             }
         }
 
-        ean->blocked_until = (record.blocked_until > (int64_t) now)
-                             ? (time_t) record.blocked_until : 0;
-        ean->last_seen = (record.last_seen > 0
-                          && record.last_seen <= (int64_t) now)
-                         ? (time_t) record.last_seen : now;
+        ean->blocked_until = (rec_blocked > (int64_t) now)
+                             ? (time_t) rec_blocked : 0;
+        ean->last_seen = (rec_seen > 0 && rec_seen <= (int64_t) now)
+                         ? (time_t) rec_seen : now;
         ean->event_head = 0;
         ean->event_count = 0;
         events = ngx_http_error_abuse_events(ean);
 
-        for (i = 0; i < record.event_count; i++) {
-            ngx_memcpy(&stored_when, p, sizeof(stored_when));
-            p += sizeof(int64_t);
+        for (i = 0; i < rec_event_count; i++) {
+            stored_when = (int64_t) ngx_http_error_abuse_get_u64(p);
+            p += 8;
             if (stored_when > (int64_t) (now - zone->interval)
                 && stored_when <= (int64_t) now)
             {
                 events[ean->event_count++] = (time_t) stored_when;
             }
         }
+        loaded++;
     }
 
     ngx_shmtx_unlock(&zone->shpool->mutex);
     ngx_free(buffer);
+
+    if (dropped != 0) {
+        ngx_log_error(NGX_LOG_WARN, log, 0,
+                      "error_abuse persistence file \"%V\" partially loaded: "
+                      "%uD records restored, %uD dropped (insufficient shared "
+                      "memory or truncated file)",
+                      &zone->persist, loaded, dropped);
+    } else {
+        ngx_log_error(NGX_LOG_INFO, log, 0,
+                      "error_abuse persistence file \"%V\" loaded: %uD records",
+                      &zone->persist, loaded);
+    }
+
     return NGX_OK;
 }
 
@@ -2757,24 +3520,24 @@ static ngx_int_t
 ngx_http_error_abuse_validate_snapshot(ngx_http_error_abuse_zone_t *zone,
     u_char *p, u_char *last, uint32_t records)
 {
-    uint32_t                            i;
-    size_t                              payload;
-    ngx_http_error_abuse_file_record_t  record;
+    uint32_t   i;
+    uint16_t   rec_key_len, rec_event_count;
+    size_t     payload;
 
     for (i = 0; i < records; i++) {
-        if ((size_t) (last - p) < sizeof(record)) {
+        if ((size_t) (last - p) < NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN) {
             return NGX_ERROR;
         }
 
-        ngx_memcpy(&record, p, sizeof(record));
-        p += sizeof(record);
+        rec_key_len = ngx_http_error_abuse_get_u16(p);
+        rec_event_count = ngx_http_error_abuse_get_u16(p + 2);
+        p += NGX_HTTP_ERROR_ABUSE_FILE_REC_LEN;
 
-        if (record.key_len == 0 || record.event_count > zone->threshold) {
+        if (rec_key_len == 0 || rec_event_count > zone->threshold) {
             return NGX_ERROR;
         }
 
-        payload = (size_t) record.key_len
-                  + (size_t) record.event_count * sizeof(int64_t);
+        payload = (size_t) rec_key_len + (size_t) rec_event_count * 8;
         if ((size_t) (last - p) < payload) {
             return NGX_ERROR;
         }

@@ -69,18 +69,36 @@ def expect(port: int, path: str, expected: int) -> None:
         raise AssertionError(f"{path}: expected {expected}, got {actual}")
 
 
+def fetch(port: int, path: str) -> tuple[int, dict[str, str]]:
+    """Return (status, headers) so cache/Retry-After headers can be asserted."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        headers={"Connection": "close", "User-Agent": "error-abuse-ci/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as response:
+            response.read()
+            return response.status, {k.lower(): v
+                                     for k, v in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        exc.read()
+        return exc.code, {k.lower(): v for k, v in exc.headers.items()}
+
+
 def nginx_config(root: pathlib.Path, port: int, module: pathlib.Path | None,
                  workers: int, keyed_key: str = "$arg_client",
                  redis_port: int | None = None,
-                 redis_prefix: str = "error-abuse-ci:") -> str:
+                 redis_prefix: str = "error-abuse-ci:",
+                 redis_password: str | None = None) -> str:
     load = f"load_module {module};\n" if module else ""
     redis = ""
     redis_zone = ""
     redis_locations = ""
     if redis_port is not None:
+        auth = f" password={redis_password}" if redis_password else ""
         redis = (
             f"    error_abuse_redis host=127.0.0.1 port={redis_port} "
-            f"prefix={redis_prefix} timeout=250ms;\n"
+            f"prefix={redis_prefix} timeout=250ms{auth};\n"
         )
         redis_zone = """    error_abuse_zone zone=cluster:1m key=$arg_client
                      statuses=404 interval=5s threshold=3 block=10s
@@ -115,11 +133,17 @@ http {{
                      statuses=404 interval=5s threshold=2 block=10s;
     error_abuse_zone zone=dry:1m key=$binary_remote_addr
                      statuses=404 interval=5s threshold=1 block=10s;
+    error_abuse_zone zone=dryshared:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=2 block=30s;
     error_abuse_zone zone=window:1m key=$binary_remote_addr
                      statuses=404 interval=1s threshold=3 block=10s;
     error_abuse_zone zone=persisted:1m key=$binary_remote_addr
                      statuses=404 interval=30s threshold=3 block=10s
                      persist={root}/persisted.state persist_interval=100ms;
+    error_abuse_zone zone=secret:1m key=$binary_remote_addr
+                     statuses=404 interval=30s threshold=2 block=30s
+                     persist={root}/secret.state persist_interval=100ms
+                     persist_secret=00112233445566778899aabbccddeeff;
 
     server {{
         listen 127.0.0.1:{port};
@@ -160,6 +184,15 @@ http {{
             empty_gif;
         }}
 
+        location = /dryshared-dry {{
+            error_abuse zone=dryshared dry_run=on;
+            root {root}/empty;
+        }}
+        location = /dryshared-ok {{
+            error_abuse zone=dryshared status=429;
+            empty_gif;
+        }}
+
         location = /window-error {{
             error_abuse zone=window status=429;
             root {root}/empty;
@@ -177,6 +210,15 @@ http {{
             error_abuse zone=persisted status=429;
             empty_gif;
         }}
+
+        location = /secret-error {{
+            error_abuse zone=secret status=429;
+            root {root}/empty;
+        }}
+        location = /secret-ok {{
+            error_abuse zone=secret status=429;
+            empty_gif;
+        }}
 {redis_locations}
     }}
 }}
@@ -187,7 +229,8 @@ class Nginx:
     def __init__(self, binary: pathlib.Path, module: pathlib.Path | None,
                  root: pathlib.Path, port: int, runner: str,
                  single_process: bool, redis_port: int | None = None,
-                 redis_prefix: str = "error-abuse-ci:") -> None:
+                 redis_prefix: str = "error-abuse-ci:",
+                 redis_password: str | None = None) -> None:
         self.binary = binary
         self.module = module
         self.root = root
@@ -196,6 +239,7 @@ class Nginx:
         self.single_process = single_process
         self.redis_port = redis_port
         self.redis_prefix = redis_prefix
+        self.redis_password = redis_password
         self.process: subprocess.Popen[str] | None = None
         self.output_path = root / "nginx-output.log"
 
@@ -207,7 +251,7 @@ class Nginx:
         (self.root / "conf" / "nginx.conf").write_text(
             nginx_config(
                 self.root, self.port, self.module, workers, keyed_key,
-                self.redis_port, self.redis_prefix,
+                self.redis_port, self.redis_prefix, self.redis_password,
             ),
             encoding="ascii",
         )
@@ -305,31 +349,35 @@ class Nginx:
 
 class RedisServer:
     def __init__(self, binary: pathlib.Path, root: pathlib.Path,
-                 port: int) -> None:
+                 port: int, requirepass: str | None = None) -> None:
         self.binary = binary
         self.root = root
         self.port = port
+        self.requirepass = requirepass
         self.process: subprocess.Popen[str] | None = None
 
     def start(self) -> None:
-        self.root.mkdir(parents=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            str(self.binary),
+            "--bind", "127.0.0.1",
+            "--port", str(self.port),
+            "--save", "",
+            "--appendonly", "no",
+            "--dir", str(self.root),
+        ]
+        if self.requirepass:
+            cmd += ["--requirepass", self.requirepass]
         self.process = subprocess.Popen(
-            [
-                str(self.binary),
-                "--bind", "127.0.0.1",
-                "--port", str(self.port),
-                "--save", "",
-                "--appendonly", "no",
-                "--dir", str(self.root),
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         wait_port(self.port)
         # Flush all data to ensure clean state for each test
+        flush = ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port)]
+        if self.requirepass:
+            flush += ["-a", self.requirepass]
         subprocess.run(
-            ["redis-cli", "-h", "127.0.0.1", "-p", str(self.port), "FLUSHALL"],
+            flush + ["FLUSHALL"],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -382,9 +430,55 @@ def test_redis_multi_host(binary: pathlib.Path,
         redis.stop()
         time.sleep(0.3)
         expect(first.port, "/redis-ok?client=redis-down", 200)
+
+        # CI-5: Redis comes back -> the workers reconnect (backoff) and shared
+        # blocking resumes.
+        redis = RedisServer(redis_binary, root / "redis", redis_port)
+        redis.start()
+        time.sleep(3.0)   # allow reconnect backoff + handshake
+        expect(first.port, "/redis-error?client=again", 404)
+        time.sleep(0.05)
+        expect(second.port, "/redis-error?client=again", 404)
+        time.sleep(0.05)
+        expect(first.port, "/redis-error?client=again", 404)
+        time.sleep(0.05)
+        expect(second.port, "/redis-ok?client=again", 429)
     finally:
         first.stop()
         second.stop()
+        redis.stop()
+
+
+def test_redis_auth(binary: pathlib.Path, module: pathlib.Path | None,
+                    root: pathlib.Path, runner: str, single_process: bool,
+                    nginx_port: int, redis_binary: pathlib.Path) -> None:
+    # CI-5: password-protected Redis exercises the AUTH handshake (COR-5) and
+    # that blocking still works through it.
+    redis_port = nginx_port + 30
+    prefix = f"error-abuse-auth-{os.getpid()}-{int(time.time()*1000)}:"
+    redis = RedisServer(redis_binary, root / "redis-auth", redis_port,
+                        requirepass="s3cr3t-pass")
+    server = Nginx(
+        binary, module, root / "redis-auth-nginx", nginx_port + 3, runner,
+        single_process, redis_port, prefix, redis_password="s3cr3t-pass",
+    )
+    try:
+        redis.start()
+        server.start()
+        time.sleep(0.3)
+
+        expect(server.port, "/redis-error?client=authed", 404)
+        time.sleep(0.05)
+        expect(server.port, "/redis-error?client=authed", 404)
+        time.sleep(0.05)
+        expect(server.port, "/redis-error?client=authed", 404)
+        time.sleep(0.05)
+        expect(server.port, "/redis-ok?client=authed", 429)
+
+        server.stop()
+        server.assert_clean_logs()
+    finally:
+        server.stop()
         redis.stop()
 
 
@@ -418,8 +512,96 @@ http {{
         )
 
 
+def expect_valid_config(binary: pathlib.Path, module: pathlib.Path | None,
+                        root: pathlib.Path, runner: str, name: str,
+                        http_config: str) -> None:
+    good = root / name
+    (good / "conf").mkdir(parents=True)
+    (good / "logs").mkdir()
+    load = f"load_module {module};\n" if module else ""
+    (good / "conf" / "nginx.conf").write_text(
+        f"""{load}error_log {good}/logs/error.log;
+events {{}}
+http {{
+{http_config}
+}}
+""",
+        encoding="ascii",
+    )
+    command = shlex.split(runner) + [
+        str(binary), "-p", str(good), "-c", str(good / "conf" / "nginx.conf"),
+        "-t",
+    ]
+    result = subprocess.run(
+        command, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, timeout=20,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{name} config was rejected but should be valid:\n{result.stdout}"
+        )
+
+
+def test_valid_configs(binary: pathlib.Path, module: pathlib.Path | None,
+                       root: pathlib.Path, runner: str) -> None:
+    # COR-1: the documented one-argument forms must be accepted (were rejected
+    # by NGX_CONF_2MORE before the fix).
+    expect_valid_config(
+        binary, module, root, runner, "minimal-zone",
+        "    error_abuse_zone zone=minimal:1m;",
+    )
+    expect_valid_config(
+        binary, module, root, runner, "minimal-redis",
+        """    error_abuse_redis host=127.0.0.1;
+    error_abuse_zone zone=minimal:1m redis=on;""",
+    )
+
+
 def test_invalid_configs(binary: pathlib.Path, module: pathlib.Path | None,
                          root: pathlib.Path, runner: str) -> None:
+    # COR-8: a trailing comma in the status list is malformed, not ignored.
+    expect_invalid_config(
+        binary, module, root, runner, "trailing-comma-status",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404, interval=1s threshold=2 block=1s;""",
+        "invalid error_abuse status list",
+    )
+    # COR-3: an explicit inactive shorter than interval/block is rejected.
+    expect_invalid_config(
+        binary, module, root, runner, "short-inactive",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=5m threshold=2 block=1h
+                         inactive=1s;""",
+        "inactive must be >=",
+    )
+    # SEC-5: persist_secret without persist, and odd-length hex, are rejected.
+    expect_invalid_config(
+        binary, module, root, runner, "secret-without-persist",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         persist_secret=00ff;""",
+        "persist_secret requires persist",
+    )
+    secret_state = root / "oddsecret.state"
+    expect_invalid_config(
+        binary, module, root, runner, "secret-odd-hex",
+        f"""    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s
+                         persist={secret_state} persist_secret=abc;""",
+        "invalid error_abuse_zone parameter",
+    )
+    # COR-6: "off" then a real declaration in the same block is a duplicate,
+    # regardless of order.
+    expect_invalid_config(
+        binary, module, root, runner, "off-then-zone",
+        """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
+                         statuses=404 interval=1s threshold=2 block=1s;
+    server {
+        error_abuse off;
+        error_abuse zone=bad status=429;
+    }""",
+        "is duplicate",
+    )
     expect_invalid_config(
         binary, module, root, runner, "bad-status",
         """    error_abuse_zone zone=bad:1m key=$binary_remote_addr
@@ -481,9 +663,14 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="error-abuse-ci-") as tmp:
         root = pathlib.Path(tmp)
+        test_valid_configs(binary, module, root, args.runner)
         test_invalid_configs(binary, module, root, args.runner)
         if args.redis_server:
             test_redis_multi_host(
+                binary, module, root, args.runner, args.single_process,
+                args.port, pathlib.Path(args.redis_server).absolute(),
+            )
+            test_redis_auth(
                 binary, module, root, args.runner, args.single_process,
                 args.port, pathlib.Path(args.redis_server).absolute(),
             )
@@ -503,13 +690,33 @@ def main() -> int:
             expect(args.port, "/denied", 403)
             expect(args.port, "/ok", 200)
             expect(args.port, "/missing", 404)
-            expect(args.port, "/ok", 429)
+            # RFC-1/SEC-2 + RFC-2: the synthetic 429 must be non-cacheable and
+            # advertise a retry deadline.
+            status, headers = fetch(args.port, "/ok")
+            if status != 429:
+                raise AssertionError(f"/ok expected 429, got {status}")
+            cache_control = headers.get("cache-control", "")
+            if "no-store" not in cache_control or "private" not in cache_control:
+                raise AssertionError(
+                    f"block response Cache-Control missing private/no-store: "
+                    f"{cache_control!r}"
+                )
+            if "retry-after" not in headers:
+                raise AssertionError("block response missing Retry-After")
             time.sleep(2.2)
             expect(args.port, "/ok", 200)
 
             expect(args.port, "/dry-error", 404)
             expect(args.port, "/dry-ok", 200)
             expect(args.port, "/dry-error", 404)
+
+            # COR-2: dry-run must not write shared state. Flood the dry-run
+            # location past its threshold, then a sibling location on the SAME
+            # zone must still serve normally (no ban was created).
+            for _ in range(5):
+                expect(args.port, "/dryshared-dry", 404)
+            expect(args.port, "/dryshared-ok", 200)
+            expect(args.port, "/dryshared-ok", 200)
 
             expect(args.port, "/key-error?client=a", 404)
             expect(args.port, "/key-error?client=b", 404)
@@ -594,6 +801,35 @@ def main() -> int:
             expect(args.port, "/persist-error", 404)
             expect(args.port, "/persist-ok", 200)
             nginx.stop()
+
+            # SEC-5: HMAC-authenticated snapshot round-trips, and a tampered
+            # MAC is rejected on load (no ban restored).
+            nginx.start()
+            expect(args.port, "/secret-error", 404)
+            expect(args.port, "/secret-error", 404)
+            expect(args.port, "/secret-ok", 429)
+            nginx.stop()
+
+            secret_state = nginx.root / "secret.state"
+            sdata = secret_state.read_bytes()
+            if len(sdata) < 33:
+                raise AssertionError("secret snapshot missing HMAC tail")
+
+            nginx.start()                       # untampered: ban restored
+            expect(args.port, "/secret-ok", 429)
+            nginx.stop()
+
+            # Flip a bit in the trailing HMAC (CRC covers payload only, so only
+            # the HMAC catches this) — load must ignore the file.
+            tampered = bytearray(secret_state.read_bytes())
+            tampered[-1] ^= 0x01
+            secret_state.write_bytes(bytes(tampered))
+            os.chmod(secret_state, 0o600)
+
+            nginx.start()
+            expect(args.port, "/secret-ok", 200)   # not restored
+            nginx.stop()
+
             nginx.assert_clean_logs()
         finally:
             nginx.stop()
